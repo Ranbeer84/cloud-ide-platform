@@ -1,0 +1,37 @@
+services:
+  streaming:
+    image: node:20-bookworm
+    working_dir: /repo
+    volumes:
+      - .:/repo
+      - streaming-node-modules:/repo/node_modules
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: "4000"
+      WEB_ORIGIN: "http://localhost:5173"
+    command: >
+      sh -c "corepack enable && corepack prepare pnpm@9.0.0 --activate &&
+      pnpm install --frozen-lockfile=false &&
+      pnpm --filter @live/streaming run dev"
+
+  web:
+    image: node:20-bookworm
+    working_dir: /repo
+    volumes:
+      - .:/repo
+      - web-node-modules:/repo/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_STREAMING_URL: "http://localhost:4000"
+    depends_on:
+      - streaming
+    command: >
+      sh -c "corepack enable && corepack prepare pnpm@9.0.0 --activate &&
+      pnpm install --frozen-lockfile=false &&
+      pnpm --filter @live/web run dev -- --host 0.0.0.0"
+
+volumes:
+  streaming-node-modules:
+  web-node-modules:
