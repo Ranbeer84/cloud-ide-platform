@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+
+# ---- Build stage: compile TypeScript + node-pty's native addon ----
+FROM node:20-bookworm AS builder
+WORKDIR /app
+
+# node-pty needs a native toolchain to build its addon during `npm install`.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY package.json tsconfig.json ./
+RUN npm install
+
+COPY src ./src
+RUN npm run build
+
+# ---- Runtime stage: lean image actually used for spawned sandboxes ----
+FROM node:20-bookworm-slim AS runtime
+WORKDIR /app
+
+# tini       - PID 1 init; reaps zombie processes spawned by the interactive shell
+# bash       - default sandbox shell
+# coreutils  - baseline shell utilities
+# procps     - ps/top, useful for introspecting the sandbox from inside
+# curl       - used by the container HEALTHCHECK
+# stress-ng  - used by Phase 1 verification to trigger and observe OOM kills
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      tini bash coreutils procps curl stress-ng \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system sandbox \
+    && useradd --system --create-home --gid sandbox --shell /bin/bash sandbox \
+    && mkdir -p /workspace \
+    && chown -R sandbox:sandbox /workspace /app
+
+COPY --from=builder --chown=sandbox:sandbox /app/dist ./dist
+COPY --from=builder --chown=sandbox:sandbox /app/node_modules ./node_modules
+COPY --from=builder --chown=sandbox:sandbox /app/package.json ./package.json
+
+USER sandbox
+ENV NODE_ENV=production \
+    PORT=7777 \
+    SANDBOX_WORKDIR=/workspace
+WORKDIR /workspace
+
+EXPOSE 7777
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -sf http://localhost:7777/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "/app/dist/server.js"]
