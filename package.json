@@ -12,6 +12,7 @@
     "lint:no-any": "! grep -RIn --include='*.ts' --include='*.tsx' -E '\\bany\\b' packages/shared-types/src"
   },
   "devDependencies": {
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "ws": "^8.18.0"
   }
 }

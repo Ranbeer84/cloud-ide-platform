@@ -11,3 +11,15 @@ export type {
   SocketErrorPayload,
   SessionAck,
 } from "./socketEvents.js";
+export type {
+  FsEntryKind,
+  FsEntryRef,
+  FsTreeNode,
+  FsChangeEvent,
+  CreateFileRequest,
+  UpdateFileRequest,
+  RenameFileRequest,
+  DeleteFileRequest,
+  ReadFileResponse,
+  FsErrorResponse,
+} from "./fsEvents.js";
