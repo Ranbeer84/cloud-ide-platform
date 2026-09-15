@@ -6,8 +6,10 @@ import type { ContainerInspection, ExecResult, ManagedContainer, SpawnContainerO
  *
  * Labels passed into spawnContainer are merged with our own bookkeeping
  * labels rather than replacing them, and are stored as-is on the returned
- * ManagedContainer. This is the extension point Phase 3 uses to attach
- * reverse-proxy routing labels without touching this class's logic.
+ * ManagedContainer. Phase 3 uses this extension point to attach
+ * reverse-proxy routing labels (proxyLabels.ts) without touching this
+ * class's core logic, and additionally joins every spawned container to the
+ * Docker network Traefik watches.
  */
 export declare class DockerManager {
     private readonly docker;

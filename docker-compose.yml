@@ -32,6 +32,35 @@ services:
       pnpm install --frozen-lockfile=false &&
       pnpm --filter @live/web run dev -- --host 0.0.0.0"
 
+  # Phase 3: reverse proxy. Auto-discovers sandbox session containers via
+  # Docker labels (see packages/orchestrator/src/containers/proxyLabels.ts)
+  # and routes http://<session-id>.localhost/ to the session's container on
+  # port 8080, with zero manual config edits or restarts as sessions come
+  # and go.
+  traefik:
+    image: traefik:v3.1
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    ports:
+      # Public entrypoint for routed session subdomains.
+      - "80:80"
+      # Traefik dashboard/API (http://localhost:8080/dashboard/).
+      - "8080:8080"
+    volumes:
+      - ./packages/proxy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      # Read-only socket mount: Traefik only needs to watch container
+      # metadata, never to create/modify/stop containers.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - live-network
+
 volumes:
   streaming-node-modules:
   web-node-modules:
+
+networks:
+  # Instruct Compose to attach to the externally managed network instead
+  # of attempting to create or claim ownership of it.
+  live-network:
+    name: live-network
+    external: true

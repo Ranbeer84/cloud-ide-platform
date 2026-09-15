@@ -1,0 +1,36 @@
+# Static configuration for the Phase 3 reverse proxy.
+#
+# The Docker provider watches the Docker socket and auto-discovers routes
+# from container labels (see
+# packages/orchestrator/src/containers/proxyLabels.ts). Routes appear the
+# moment a labeled sandbox container starts and disappear the moment it
+# stops or is removed — no manual edits to this file and no Traefik restart
+# are ever required.
+
+entryPoints:
+  # Public entrypoint every session's subdomain is routed through.
+  web:
+    address: ":80"
+  # Traefik's own dashboard/API entrypoint (see `api` block below).
+  traefik:
+    address: ":8080"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    # Only containers explicitly labeled traefik.enable=true are routed.
+    # Sandbox containers get this label automatically from proxyLabels.ts;
+    # nothing else on the Docker host is exposed by accident.
+    exposedByDefault: false
+    # Must match the network dockerManager.ts attaches sandbox containers to
+    # (PROXY_NETWORK_NAME) and the network declared in docker-compose.yml.
+    network: "live-network"
+    # Poll/subscribe to Docker events so routers are added and removed live.
+    watch: true
+
+api:
+  dashboard: true
+  insecure: true
+
+log:
+  level: INFO

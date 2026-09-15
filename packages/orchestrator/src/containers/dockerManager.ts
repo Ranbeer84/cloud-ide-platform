@@ -6,6 +6,11 @@ import type {
   SpawnContainerOptions,
   StopContainerOptions,
 } from "./containerTypes.js";
+import {
+  computeProxyLabels,
+  DEFAULT_PROXY_TARGET_PORT,
+  PROXY_NETWORK_NAME,
+} from "./proxyLabels.js";
 
 /** Label used to identify (and later list/filter) every container we spawn. */
 const MANAGED_LABEL_KEY = "live.managed";
@@ -19,13 +24,43 @@ function toDockerEnv(env: Readonly<Record<string, string>> | undefined): string[
 }
 
 /**
+ * Makes sure the Docker network shared by Traefik and every sandbox
+ * container exists before we try to attach a container to it. Idempotent:
+ * safe to call on every spawnContainer regardless of whether `docker
+ * compose up` (which also creates this network) has already run, and safe
+ * under concurrent spawns racing to create it for the first time.
+ */
+async function ensureProxyNetwork(docker: Docker, networkName: string): Promise<void> {
+  const existing = await docker.listNetworks({ filters: { name: [networkName] } });
+  const alreadyExists = existing.some((network) => network.Name === networkName);
+  if (alreadyExists) {
+    return;
+  }
+
+  try {
+    await docker.createNetwork({ Name: networkName, CheckDuplicate: true, Driver: "bridge" });
+  } catch (error) {
+    if (!isNetworkAlreadyExists(error)) {
+      throw error;
+    }
+  }
+}
+
+function isNetworkAlreadyExists(error: unknown): boolean {
+  const message = (error as { message?: string } | undefined)?.message ?? "";
+  return message.includes("already exists");
+}
+
+/**
  * Thin, testable wrapper around dockerode covering exactly the container
  * lifecycle the orchestrator needs: spawn, exec, inspect, stop.
  *
  * Labels passed into spawnContainer are merged with our own bookkeeping
  * labels rather than replacing them, and are stored as-is on the returned
- * ManagedContainer. This is the extension point Phase 3 uses to attach
- * reverse-proxy routing labels without touching this class's logic.
+ * ManagedContainer. Phase 3 uses this extension point to attach
+ * reverse-proxy routing labels (proxyLabels.ts) without touching this
+ * class's core logic, and additionally joins every spawned container to the
+ * Docker network Traefik watches.
  */
 export class DockerManager {
   private readonly docker: Docker;
@@ -35,7 +70,18 @@ export class DockerManager {
   }
 
   async spawnContainer(options: SpawnContainerOptions): Promise<ManagedContainer> {
+    // Every sandbox container must share a Docker network with Traefik for
+    // the labels below to result in a working route (Traefik's Docker
+    // provider resolves containers by network, not by published host port).
+    await ensureProxyNetwork(this.docker, PROXY_NETWORK_NAME);
+
+    const proxyLabels = computeProxyLabels(options.sessionId, {
+      targetPort: DEFAULT_PROXY_TARGET_PORT,
+      network: PROXY_NETWORK_NAME,
+    });
+
     const labels: Record<string, string> = {
+      ...proxyLabels,
       [MANAGED_LABEL_KEY]: "true",
       [SESSION_LABEL_KEY]: options.sessionId,
       ...(options.labels ?? {}),
@@ -55,6 +101,11 @@ export class DockerManager {
         PidsLimit: options.resourceLimits.pidsLimit,
         PortBindings: { [containerPort]: [{ HostPort: "0" }] },
         RestartPolicy: { Name: "no" },
+      },
+      NetworkingConfig: {
+        EndpointsConfig: {
+          [PROXY_NETWORK_NAME]: {},
+        },
       },
       Tty: false,
     });
