@@ -11,3 +11,9 @@ node_modules/
 # Build outputs & TypeScript build cache
 dist/
 *.tsbuildinfo
+
+# Local secrets / env
+.env
+
+# Verify-script temp files
+*.tmp.mjs

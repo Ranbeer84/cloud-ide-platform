@@ -1,5 +1,5 @@
 import Docker from "dockerode";
-import { computeProxyLabels, DEFAULT_PROXY_TARGET_PORT, PROXY_NETWORK_NAME, } from "./proxyLabels.js";
+import { computeProxyLabels, DEFAULT_PROXY_TARGET_PORT, getHostSuffixFromEnv, PROXY_NETWORK_NAME, } from "./proxyLabels.js";
 /** Label used to identify (and later list/filter) every container we spawn. */
 const MANAGED_LABEL_KEY = "live.managed";
 const SESSION_LABEL_KEY = "live.session-id";
@@ -59,6 +59,10 @@ export class DockerManager {
         const proxyLabels = computeProxyLabels(options.sessionId, {
             targetPort: DEFAULT_PROXY_TARGET_PORT,
             network: PROXY_NETWORK_NAME,
+            // Phase 4: SESSION_HOST_SUFFIX (e.g. ".sessions.yourdomain.dev")
+            // switches routing to a real domain and enables HTTPS labels.
+            // Unset => ".localhost" over plain HTTP (Phase 3 behavior).
+            hostSuffix: getHostSuffixFromEnv(),
         });
         const labels = {
             ...proxyLabels,

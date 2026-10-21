@@ -30,26 +30,43 @@ services:
     command: >
       sh -c "corepack enable && corepack prepare pnpm@9.0.0 --activate &&
       pnpm install --frozen-lockfile=false &&
-      pnpm --filter @live/web run dev -- --host 0.0.0.0"
+      pnpm --filter @live/web run dev"
 
-  # Phase 3: reverse proxy. Auto-discovers sandbox session containers via
-  # Docker labels (see packages/orchestrator/src/containers/proxyLabels.ts)
-  # and routes http://<session-id>.localhost/ to the session's container on
-  # port 8080, with zero manual config edits or restarts as sessions come
-  # and go.
   traefik:
     image: traefik:v3.1
+    entrypoint: ["/bin/sh", "-c"]
+    # `$$` escapes compose interpolation so the shell (not compose) expands
+    # these at container start. acme.yml is appended to traefik.yml and its
+    # placeholders substituted, giving Traefik ONE static config file.
     command:
-      - "--configFile=/etc/traefik/traefik.yml"
+      - |
+        set -e
+        touch /letsencrypt/acme.json
+        chmod 600 /letsencrypt/acme.json
+        {
+          cat /etc/traefik/traefik.yml
+          echo
+          sed -e "s|__ACME_EMAIL__|$${ACME_EMAIL}|g" \
+              -e "s|__ACME_CA_SERVER__|$${ACME_CA_SERVER}|g" \
+              /etc/traefik/acme.yml
+        } > /etc/traefik/merged.yml
+        exec traefik --configFile=/etc/traefik/merged.yml
     ports:
-      # Public entrypoint for routed session subdomains.
       - "80:80"
-      # Traefik dashboard/API (http://localhost:8080/dashboard/).
+      - "443:443"
+      # Traefik dashboard/API (http://localhost:8080/dashboard/). Dev only --
+      # lock this down before exposing the host publicly (Phase 7).
       - "8080:8080"
+    environment:
+      ACME_EMAIL: "${ACME_EMAIL:-dev@example.invalid}"
+      ACME_CA_SERVER: "${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+      # Read by Traefik's Cloudflare DNS-01 provider (not a TRAEFIK_* var).
+      CF_DNS_API_TOKEN: "${CF_DNS_API_TOKEN:-}"
     volumes:
       - ./packages/proxy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      # Read-only socket mount: Traefik only needs to watch container
-      # metadata, never to create/modify/stop containers.
+      - ./packages/proxy/traefik/acme.yml:/etc/traefik/acme.yml:ro
+      - letsencrypt-storage:/letsencrypt
+      # Read-only: Traefik only watches container metadata.
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - live-network
@@ -57,10 +74,9 @@ services:
 volumes:
   streaming-node-modules:
   web-node-modules:
+  letsencrypt-storage:
 
 networks:
-  # Instruct Compose to attach to the externally managed network instead
-  # of attempting to create or claim ownership of it.
   live-network:
     name: live-network
     external: true

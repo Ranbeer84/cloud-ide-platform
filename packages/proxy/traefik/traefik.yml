@@ -1,4 +1,5 @@
-# Static configuration for the Phase 3 reverse proxy.
+# Static configuration for the reverse proxy (Phase 3, extended in Phase 4).
+# At container start, acme.yml is appended to this file (see docker-compose.yml).
 #
 # The Docker provider watches the Docker socket and auto-discovers routes
 # from container labels (see
@@ -11,6 +12,10 @@ entryPoints:
   # Public entrypoint every session's subdomain is routed through.
   web:
     address: ":80"
+  # Phase 4: HTTPS entrypoint. Defined here (not via TRAEFIK_* env vars)
+  # because Traefik ignores env-var static config when a config file is used.
+  websecure:
+    address: ":443"
   # Traefik's own dashboard/API entrypoint (see `api` block below).
   traefik:
     address: ":8080"

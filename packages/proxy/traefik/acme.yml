@@ -1,0 +1,33 @@
+# Phase 4: Let's Encrypt resolver (DNS-01, wildcard-capable).
+#
+# This file is concatenated onto traefik.yml at container start by the
+# traefik service in docker-compose.yml (placeholders below are replaced
+# from the ACME_EMAIL / ACME_CA_SERVER env vars). Everything lives in ONE
+# static config file on purpose: Traefik uses a single static-configuration
+# source (file OR CLI OR env), so mixing TRAEFIK_* env vars with a config
+# file silently ignores the env vars.
+#
+# The resolver name "letsencrypt" must match DEFAULT_CERT_RESOLVER in
+# packages/orchestrator/src/containers/proxyLabels.ts.
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "__ACME_EMAIL__"
+      # Persisted in the `letsencrypt-storage` named volume so the issued
+      # wildcard certificate survives container restarts (Let's Encrypt
+      # rate-limits duplicate issuance).
+      storage: "/letsencrypt/acme.json"
+      # Start with the staging CA while testing to avoid rate limits:
+      #   https://acme-staging-v02.api.letsencrypt.org/directory
+      caServer: "__ACME_CA_SERVER__"
+      # Wildcard certificates REQUIRE DNS-01.
+      dnsChallenge:
+        # Cloudflare reads its credential from the CF_DNS_API_TOKEN env var
+        # (token needs Zone:DNS:Edit + Zone:Zone:Read on your zone). To use
+        # another DNS provider, change this value and the env var passed to
+        # the traefik service: https://doc.traefik.io/traefik/https/acme/#providers
+        provider: "cloudflare"
+        resolvers:
+          - "1.1.1.1:53"
+          - "8.8.8.8:53"

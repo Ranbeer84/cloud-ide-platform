@@ -4,7 +4,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "Starting docker compose stack (streaming + web)..."
+echo "Ensuring shared proxy network exists..."
+./scripts/ensure-proxy-network.sh
+
+echo "Starting docker compose stack (streaming + web + traefik)..."
 docker compose up -d
 
 HOST_URL="http://localhost:5173/host"
