@@ -71,10 +71,27 @@ services:
     networks:
       - live-network
 
+  redis:
+    image: redis:7-alpine
+    # AOF persistence so session records survive a Redis restart too.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      # Loopback only: the orchestrator runs on the host and connects here.
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+
 volumes:
   streaming-node-modules:
   web-node-modules:
   letsencrypt-storage:
+  redis-data:
 
 networks:
   live-network:

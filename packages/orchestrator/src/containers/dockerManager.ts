@@ -1,6 +1,7 @@
 import Docker from "dockerode";
 import type {
   ContainerInspection,
+  ContainerLabels,
   ExecResult,
   ManagedContainer,
   SpawnContainerOptions,
@@ -211,15 +212,21 @@ export class DockerManager {
       filters: { label: [`${MANAGED_LABEL_KEY}=true`] },
     });
 
-    return containers.map((info) => ({
-      containerId: info.Id,
-      sessionId: info.Labels[SESSION_LABEL_KEY] ?? "unknown",
-      image: info.Image,
-      hostAgentPort: Number(info.Ports[0]?.PublicPort ?? 0),
-      labels: info.Labels,
-      createdAt: info.Created * 1000,
-      status: info.State === "running" ? "running" : "stopped",
-    }));
+    // Docker reports `Ports: null` (not `[]`) for containers that are not
+    // running, so every field read from the list response must tolerate
+    // null/undefined rather than assume the typings are always honored.
+    return containers.map((info) => {
+      const labels: ContainerLabels = info.Labels ?? {};
+      return {
+        containerId: info.Id,
+        sessionId: labels[SESSION_LABEL_KEY] ?? "unknown",
+        image: info.Image,
+        hostAgentPort: Number(info.Ports?.[0]?.PublicPort ?? 0),
+        labels,
+        createdAt: info.Created * 1000,
+        status: info.State === "running" ? ("running" as const) : ("stopped" as const),
+      };
+    });
   }
 }
 
