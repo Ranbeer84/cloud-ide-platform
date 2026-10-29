@@ -1,18 +1,23 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { clientKeyFromRequest, loadOwnedSession } from "../auth/authMiddleware.js";
 import {
   ApiError,
   toSessionView,
   type ApiContext,
+  type EndSessionResponse,
   type HeartbeatResponse,
 } from "../sessionStore/sessionTypes.js";
+import type { Principal } from "../auth/authMiddleware.js";
 import { createSession } from "./createSession.js";
-import { endSession } from "./endSession.js";
+import { terminateSession } from "./endSession.js";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 type Route =
   | { readonly name: "health" }
+  | { readonly name: "login" }
+  | { readonly name: "whoami" }
   | { readonly name: "createSession" }
   | { readonly name: "listSessions" }
   | { readonly name: "getSession"; readonly sessionId: string }
@@ -36,6 +41,14 @@ function matchRoute(method: string, pathname: string): RouteMatch | undefined {
 
   if (path === "/healthz") {
     return { route: method === "GET" ? { name: "health" } : undefined, allowed: ["GET"] };
+  }
+
+  if (path === "/api/auth/login") {
+    return { route: method === "POST" ? { name: "login" } : undefined, allowed: ["POST"] };
+  }
+
+  if (path === "/api/auth/me") {
+    return { route: method === "GET" ? { name: "whoami" } : undefined, allowed: ["GET"] };
   }
 
   if (path === "/api/sessions") {
@@ -99,7 +112,7 @@ function applyCors(ctx: ApiContext, req: IncomingMessage, res: ServerResponse): 
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "600");
 }
 
@@ -148,38 +161,76 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   return parsed as Record<string, unknown>;
 }
 
-async function dispatch(ctx: ApiContext, route: Route, req: IncomingMessage, res: ServerResponse): Promise<number> {
+/** Routes callable without a token: liveness probes and the login that issues tokens. */
+function isPublicRoute(route: Route): boolean {
+  return route.name === "health" || route.name === "login";
+}
+
+/** Reads a required, bounded string field from a parsed JSON body. */
+function requireStringField(body: Record<string, unknown>, field: string): string {
+  const value = body[field];
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+    throw new ApiError(400, "invalid_body", `"${field}" must be a non-empty string of at most 256 characters`);
+  }
+  return value;
+}
+
+async function dispatch(
+  ctx: ApiContext,
+  route: Route,
+  principal: Principal | undefined,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<number> {
+  if (route.name === "health") {
+    const redisOk = await ctx.store.ping();
+    const status = redisOk ? 200 : 503;
+    sendJson(res, status, { status: redisOk ? "ok" : "degraded", redis: redisOk, time: ctx.now() });
+    return status;
+  }
+
+  if (route.name === "login") {
+    const body = await readJsonBody(req);
+    const username = requireStringField(body, "username");
+    const password = requireStringField(body, "password");
+    const result = await ctx.auth.login(username, password, clientKeyFromRequest(req));
+    sendJson(res, 200, result);
+    return 200;
+  }
+
+  // Everything below is protected: handle() resolved a principal before dispatching.
+  if (!principal) {
+    throw new ApiError(401, "unauthorized", "Authentication required");
+  }
+
   switch (route.name) {
-    case "health": {
-      const redisOk = await ctx.store.ping();
-      const status = redisOk ? 200 : 503;
-      sendJson(res, status, { status: redisOk ? "ok" : "degraded", redis: redisOk, time: ctx.now() });
-      return status;
+    case "whoami": {
+      sendJson(res, 200, { user: { id: principal.userId, username: principal.username }, authEnabled: ctx.auth.enabled });
+      return 200;
     }
 
     case "createSession": {
       await readJsonBody(req);
-      const created = await createSession(ctx);
+      const created = await createSession(ctx, principal.userId);
       sendJson(res, 201, created);
       return 201;
     }
 
     case "listSessions": {
       const records = await ctx.store.list();
-      sendJson(res, 200, { sessions: records.map((record) => toSessionView(record, ctx.config)) });
+      const owned = records.filter((record) => record.ownerId === principal.userId);
+      sendJson(res, 200, { sessions: owned.map((record) => toSessionView(record, ctx.config)) });
       return 200;
     }
 
     case "getSession": {
-      const record = await ctx.store.get(route.sessionId);
-      if (!record) {
-        throw new ApiError(404, "session_not_found", `No session with id "${route.sessionId}"`);
-      }
+      const record = await loadOwnedSession(ctx.store, route.sessionId, principal);
       sendJson(res, 200, toSessionView(record, ctx.config));
       return 200;
     }
 
     case "heartbeat": {
+      await loadOwnedSession(ctx.store, route.sessionId, principal);
       const at = ctx.now();
       const exists = await ctx.store.touch(route.sessionId, at);
       if (!exists) {
@@ -191,9 +242,16 @@ async function dispatch(ctx: ApiContext, route: Route, req: IncomingMessage, res
     }
 
     case "endSession": {
-      const ended = await endSession(ctx, route.sessionId);
+      const record = await loadOwnedSession(ctx.store, route.sessionId, principal);
+      await terminateSession(ctx, record, "api");
+      const ended: EndSessionResponse = { sessionId: route.sessionId, ended: true };
       sendJson(res, 200, ended);
       return 200;
+    }
+
+    default: {
+      const unreachable: never = route;
+      throw new Error(`Unhandled route ${JSON.stringify(unreachable)}`);
     }
   }
 }
@@ -231,12 +289,21 @@ async function handle(ctx: ApiContext, req: IncomingMessage, res: ServerResponse
       return;
     }
 
-    status = await dispatch(ctx, match.route, req, res);
+    // Authenticate before touching anything else, so an anonymous caller
+    // learns nothing beyond "401" about protected routes.
+    const principal = isPublicRoute(match.route) ? undefined : ctx.auth.authenticate(req);
+
+    status = await dispatch(ctx, match.route, principal, req, res);
   } catch (error) {
     if (error instanceof ApiError) {
       status = error.status;
       if (!res.headersSent) {
-        sendJson(res, error.status, { error: { code: error.code, message: error.message } });
+        sendJson(
+          res,
+          error.status,
+          { error: { code: error.code, message: error.message } },
+          error.status === 401 ? { "WWW-Authenticate": 'Bearer realm="live-orchestrator"' } : undefined,
+        );
       }
     } else {
       status = 500;
@@ -257,12 +324,18 @@ async function handle(ctx: ApiContext, req: IncomingMessage, res: ServerResponse
 /**
  * Builds the node:http request listener for the orchestrator API.
  *
- *   GET    /healthz                       liveness + Redis connectivity
- *   POST   /api/sessions                  spawn a sandbox, register the session
- *   GET    /api/sessions                  list sessions
- *   GET    /api/sessions/:id              one session
+ *   GET    /healthz                       liveness + Redis connectivity      (public)
+ *   POST   /api/auth/login                exchange credentials for a token   (public)
+ *   GET    /api/auth/me                   who the token belongs to
+ *   POST   /api/sessions                  spawn a sandbox owned by the caller
+ *   GET    /api/sessions                  list the caller's sessions
+ *   GET    /api/sessions/:id              one of the caller's sessions
  *   POST   /api/sessions/:id/heartbeat    record activity (resets the idle clock)
  *   DELETE /api/sessions/:id              tear the session down
+ *
+ * Every route except the two marked public needs `Authorization: Bearer
+ * <token>` and answers 401 without it. A session that belongs to someone else
+ * is indistinguishable from one that does not exist (404).
  */
 export function createRequestHandler(ctx: ApiContext): (req: IncomingMessage, res: ServerResponse) => void {
   return (req, res) => {

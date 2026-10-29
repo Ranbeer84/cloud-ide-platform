@@ -1,0 +1,139 @@
+# Network isolation for sandbox pods.
+#
+# Used in Phase 10, when sandboxes become Pods. Until then, the Docker
+# deployment gets the same guarantees from per-session networks plus
+# scripts/apply-sandbox-firewall.sh; the two are meant to enforce the same rules:
+#
+#   1. Nothing can start a connection INTO a sandbox except the proxy and the
+#      orchestrator, and only on the agent and preview ports.
+#   2. A sandbox cannot connect to other sandboxes, to anything else in the
+#      cluster, to the node it runs on, or to cloud metadata services.
+#   3. A sandbox can resolve DNS and reach the public internet.
+#
+# NetworkPolicy is enforced by the CNI plugin, not by Kubernetes itself. On a
+# cluster whose CNI does not implement it (for example plain flannel), these
+# objects are accepted and silently do nothing. Use Calico, Cilium, or a
+# managed cluster with network policy enabled, and confirm enforcement with the
+# Phase 10 verification before trusting it.
+#
+# Assumptions to adjust for your cluster:
+#   - Sandboxes run in namespace "live-sandboxes"; the proxy and orchestrator run in "live-system".
+#   - Sandbox pods are labelled app.kubernetes.io/name=live-sandbox.
+#   - Proxy pods:        app.kubernetes.io/name=live-proxy
+#   - Orchestrator pods: app.kubernetes.io/name=live-orchestrator
+#   - If your pod or service CIDRs fall OUTSIDE the private ranges excluded in
+#     the egress policy below, add them to its "except" list, or sandboxes
+#     will be able to reach the cluster through them.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: live-sandboxes
+  labels:
+    app.kubernetes.io/part-of: live
+    # Restricted Pod Security: no privileged pods, no host namespaces, no extra capabilities.
+    pod-security.kubernetes.io/enforce: restricted
+---
+# 1. Start from nothing. Selects every pod in the namespace, allows no traffic in or out.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-default-deny
+  namespace: live-sandboxes
+  labels:
+    app.kubernetes.io/part-of: live
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# 2. The only way in: the proxy (previews) and the orchestrator (agent API),
+#    from the control-plane namespace, to the two sandbox ports.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-allow-ingress-from-control-plane
+  namespace: live-sandboxes
+  labels:
+    app.kubernetes.io/part-of: live
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: live-sandbox
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # namespaceSelector and podSelector in the SAME item are ANDed:
+        # a proxy pod, and in the live-system namespace.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: live-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: live-proxy
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: live-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: live-orchestrator
+      ports:
+        - protocol: TCP
+          port: 7777 # sandbox-agent (pty, file API)
+        - protocol: TCP
+          port: 8080 # the user's dev server, served as the preview
+---
+# 3. The only way out: cluster DNS, and the public internet minus everything
+#    internal. Pod-to-pod traffic is not listed, so it is denied, which is what
+#    isolates one sandbox from another. Private ranges are excluded so a
+#    sandbox cannot reach other pods, services, nodes or the host through an
+#    address-based rule, and link-local covers the metadata endpoints.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-allow-egress-dns-and-internet
+  namespace: live-sandboxes
+  labels:
+    app.kubernetes.io/part-of: live
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: live-sandbox
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8 # RFC 1918: most pod, service and node networks
+              - 172.16.0.0/12 # RFC 1918
+              - 192.168.0.0/16 # RFC 1918
+              - 100.64.0.0/10 # carrier-grade NAT; Alibaba metadata 100.100.100.200 lives here
+              - 169.254.0.0/16 # link-local: AWS/GCP/Azure/OpenStack metadata (169.254.169.254)
+              - 168.63.129.16/32 # Azure platform endpoint (wireserver)
+              - 127.0.0.0/8 # loopback
+              - 224.0.0.0/4 # multicast
+              - 240.0.0.0/4 # reserved
+    - to:
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fc00::/7 # unique local addresses
+              - fe80::/10 # link-local
+              - fd00:ec2::254/128 # AWS IPv6 metadata endpoint
+              - ::1/128 # loopback
+              - ff00::/8 # multicast

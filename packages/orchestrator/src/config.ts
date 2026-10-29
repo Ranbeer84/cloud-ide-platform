@@ -1,3 +1,4 @@
+import { parseAuthUsers, type AuthUser } from "./auth/authMiddleware.js";
 import { getHostSuffixFromEnv } from "./containers/proxyLabels.js";
 
 /** Thrown with every problem found, so one run fixes all of them. */
@@ -13,8 +14,10 @@ export class ConfigError extends Error {
 
 export type OrphanPolicy = "kill" | "adopt";
 
+export type AuthMode = "required" | "disabled";
+
 export interface OrchestratorConfig {
-  /** Interface the API listens on. Loopback by default (no auth until Phase 7). */
+  /** Interface the API listens on. Loopback by default. */
   readonly host: string;
   readonly port: number;
 
@@ -34,6 +37,8 @@ export interface OrchestratorConfig {
   readonly sandboxReadyTimeoutMs: number;
 
   readonly maxSessions: number;
+  /** Cap on concurrently running sessions per account, so one user cannot use up maxSessions. */
+  readonly maxSessionsPerUser: number;
   /** A session with no heartbeat for this long is terminated. */
   readonly idleTimeoutMs: number;
   readonly idleReaperIntervalMs: number;
@@ -53,6 +58,21 @@ export interface OrchestratorConfig {
   readonly hostSuffix: string;
   /** https whenever hostSuffix is a real domain (matches proxyLabels' TLS default). */
   readonly previewScheme: "http" | "https";
+
+  /**
+   * "required": every /api route except login needs a bearer token (401
+   * otherwise). "disabled": no authentication, every caller is one shared
+   * anonymous account. Disabled is only accepted on a loopback listen address.
+   */
+  readonly authMode: AuthMode;
+  /** HMAC key for session tokens. Empty when authMode is "disabled". */
+  readonly authSecret: string;
+  /** Accounts that may sign in. Empty when authMode is "disabled". */
+  readonly authUsers: readonly AuthUser[];
+  readonly authTokenTtlMs: number;
+
+  /** Name of the running Traefik container. Empty means auto-detect the compose service "traefik". */
+  readonly traefikContainer: string;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -123,6 +143,11 @@ function readUrl(env: Env, problems: string[], name: string, fallback: string, p
   return raw;
 }
 
+function isLoopbackHost(host: string): boolean {
+  const value = host.toLowerCase();
+  return value === "localhost" || value === "::1" || value === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(value);
+}
+
 /**
  * Parses and validates the orchestrator's environment.
  *
@@ -140,12 +165,18 @@ function readUrl(env: Env, problems: string[], name: string, fallback: string, p
  * | SANDBOX_PIDS_LIMIT        | 256                       |
  * | SANDBOX_READY_TIMEOUT_MS  | 20000                     |
  * | MAX_SESSIONS              | 50                        |
+ * | MAX_SESSIONS_PER_USER     | 5                         |
  * | SESSION_IDLE_TIMEOUT_MS   | 1800000 (30 min)          |
  * | IDLE_REAPER_INTERVAL_MS   | 30000                     |
  * | RECONCILER_ORPHAN_POLICY  | kill  (kill | adopt)      |
  * | WEB_BASE_URL              | http://localhost:5173     |
  * | ALLOWED_ORIGIN            | (same as WEB_BASE_URL)    |
  * | SESSION_HOST_SUFFIX       | .localhost                |
+ * | ORCHESTRATOR_AUTH_MODE    | required  (required | disabled)   |
+ * | ORCHESTRATOR_AUTH_SECRET  | (none; >= 32 chars when required)  |
+ * | ORCHESTRATOR_AUTH_USERS   | (none; JSON array when required)   |
+ * | ORCHESTRATOR_AUTH_TOKEN_TTL_MS | 28800000 (8 h)        |
+ * | TRAEFIK_CONTAINER         | (auto-detect compose "traefik")    |
  */
 export function loadConfig(env: Env = process.env): OrchestratorConfig {
   const problems: string[] = [];
@@ -165,6 +196,7 @@ export function loadConfig(env: Env = process.env): OrchestratorConfig {
   const sandboxReadyTimeoutMs = readInt(env, problems, "SANDBOX_READY_TIMEOUT_MS", 20_000, 1_000, 300_000);
 
   const maxSessions = readInt(env, problems, "MAX_SESSIONS", 50, 1, 10_000);
+  const maxSessionsPerUser = readInt(env, problems, "MAX_SESSIONS_PER_USER", 5, 1, 10_000);
   const idleTimeoutMs = readInt(env, problems, "SESSION_IDLE_TIMEOUT_MS", 30 * 60 * 1000, 1_000, 7 * 24 * 3_600_000);
   const idleReaperIntervalMs = readInt(env, problems, "IDLE_REAPER_INTERVAL_MS", 30_000, 250, 3_600_000);
 
@@ -184,6 +216,40 @@ export function loadConfig(env: Env = process.env): OrchestratorConfig {
 
   const hostSuffix = getHostSuffixFromEnv(env);
 
+  const traefikContainer = readString(env, "TRAEFIK_CONTAINER", "");
+
+  const authModeRaw = readString(env, "ORCHESTRATOR_AUTH_MODE", "required");
+  let authMode: AuthMode = "required";
+  if (authModeRaw === "required" || authModeRaw === "disabled") {
+    authMode = authModeRaw;
+  } else {
+    problems.push(`ORCHESTRATOR_AUTH_MODE must be "required" or "disabled" (got "${authModeRaw}")`);
+  }
+  const authTokenTtlMs = readInt(env, problems, "ORCHESTRATOR_AUTH_TOKEN_TTL_MS", 8 * 3_600_000, 60_000, 30 * 86_400_000);
+
+  let authSecret = "";
+  let authUsers: readonly AuthUser[] = [];
+  if (authMode === "disabled") {
+    if (!isLoopbackHost(host)) {
+      problems.push(
+        `ORCHESTRATOR_AUTH_MODE=disabled is only allowed when ORCHESTRATOR_HOST is a loopback address (got "${host}")`,
+      );
+    }
+  } else {
+    authSecret = env["ORCHESTRATOR_AUTH_SECRET"]?.trim() ?? "";
+    if (authSecret.length < 32) {
+      problems.push("ORCHESTRATOR_AUTH_SECRET is required and must be at least 32 characters");
+    }
+    const rawUsers = env["ORCHESTRATOR_AUTH_USERS"]?.trim() ?? "";
+    if (rawUsers.length === 0) {
+      problems.push("ORCHESTRATOR_AUTH_USERS is required (a JSON array of accounts) unless ORCHESTRATOR_AUTH_MODE=disabled");
+    } else {
+      const parsedUsers = parseAuthUsers(rawUsers);
+      problems.push(...parsedUsers.problems);
+      authUsers = parsedUsers.users;
+    }
+  }
+
   if (problems.length > 0) {
     throw new ConfigError(problems);
   }
@@ -201,6 +267,7 @@ export function loadConfig(env: Env = process.env): OrchestratorConfig {
     sandboxPidsLimit,
     sandboxReadyTimeoutMs,
     maxSessions,
+    maxSessionsPerUser,
     idleTimeoutMs,
     idleReaperIntervalMs,
     orphanPolicy,
@@ -208,5 +275,10 @@ export function loadConfig(env: Env = process.env): OrchestratorConfig {
     allowedOrigin,
     hostSuffix,
     previewScheme: hostSuffix === ".localhost" ? "http" : "https",
+    authMode,
+    authSecret,
+    authUsers,
+    authTokenTtlMs,
+    traefikContainer,
   };
 }

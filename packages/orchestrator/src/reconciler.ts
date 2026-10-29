@@ -1,7 +1,7 @@
 import type { ManagedContainer } from "./containers/containerTypes.js";
 import type { OrphanPolicy } from "./config.js";
 import type { SessionRecord } from "./sessionStore/sessionStore.js";
-import type { Logger, OrchestratorSessionStore, SessionDocker } from "./sessionStore/sessionTypes.js";
+import { ORPHAN_OWNER_ID, type Logger, type OrchestratorSessionStore, type SessionDocker } from "./sessionStore/sessionTypes.js";
 
 export interface ReconcilerDeps {
   readonly store: OrchestratorSessionStore;
@@ -152,6 +152,9 @@ export async function reconcile(deps: ReconcilerDeps): Promise<ReconcileReport> 
         const timestamp = now();
         await store.set(container.sessionId, {
           sessionId: container.sessionId,
+          // Nobody is known to own an adopted container. No account can equal
+          // this id, so the session can be reaped but never used.
+          ownerId: ORPHAN_OWNER_ID,
           containerId: container.containerId,
           image: container.image,
           hostAgentPort: container.hostAgentPort,

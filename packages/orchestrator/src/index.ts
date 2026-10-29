@@ -2,8 +2,9 @@ import { realpathSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { fileURLToPath } from "node:url";
 import { createRequestHandler } from "./api/routes.js";
+import { Authenticator } from "./auth/authMiddleware.js";
 import { loadConfig, type OrchestratorConfig } from "./config.js";
-import { DockerManager } from "./containers/dockerManager.js";
+import { GvisorManager } from "./containers/gvisorManager.js";
 import { IdleReaper } from "./idleReaper.js";
 import { reconcile, type ReconcileReport } from "./reconciler.js";
 import { createRedisClient, RedisSessionStore } from "./sessionStore/redisStore.js";
@@ -11,6 +12,26 @@ import type { ApiContext, LogFields, Logger } from "./sessionStore/sessionTypes.
 
 // ---- Public library surface (imported by phase verification scripts) ----
 export { DockerManager } from "./containers/dockerManager.js";
+export {
+  GvisorManager,
+  SANDBOX_RUNTIME,
+  SANDBOX_NETWORK_PREFIX,
+  SANDBOX_BRIDGE_PREFIX,
+  sessionNetworkName,
+  sessionBridgeName,
+} from "./containers/gvisorManager.js";
+export type { GvisorManagerOptions } from "./containers/gvisorManager.js";
+export {
+  Authenticator,
+  TokenService,
+  hashPassword,
+  verifyPassword,
+  parseAuthUsers,
+  requireOwnedSession,
+  loadOwnedSession,
+  ANONYMOUS_PRINCIPAL,
+} from "./auth/authMiddleware.js";
+export type { AuthUser, Principal, LoginResult, AuthSettings } from "./auth/authMiddleware.js";
 export type {
   ContainerResourceLimits,
   ContainerLabels,
@@ -25,6 +46,7 @@ export type {
 export type { SessionStore, SessionRecord } from "./sessionStore/sessionStore.js";
 export { MemorySessionStore } from "./sessionStore/memoryStore.js";
 export { RedisSessionStore, createRedisClient } from "./sessionStore/redisStore.js";
+export { SESSION_SCHEMA_VERSION, ORPHAN_OWNER_ID } from "./sessionStore/sessionTypes.js";
 export type {
   ApiContext,
   CreateSessionResponse,
@@ -68,34 +90,62 @@ export interface RunningOrchestrator {
 
 /**
  * Boot sequence (order is deliberate):
- *  1. parse config                 - fail fast on bad env
- *  2. connect to Redis             - fail fast if unreachable
- *  3. reconcile Redis vs Docker    - heal crash drift BEFORE serving traffic
- *  4. start the HTTP API
- *  5. start the idle reaper
+ *  1. parse config                 - fail fast on bad env (including auth settings)
+ *  2. require the gVisor runtime   - refuse to run sandboxes any other way
+ *  3. connect to Redis             - fail fast if unreachable
+ *  4. reconcile Redis vs Docker    - heal crash drift BEFORE serving traffic
+ *  5. prune orphaned networks      - per-session networks left behind by a crash
+ *  6. start the HTTP API
+ *  7. start the idle reaper
  */
 export async function startOrchestrator(
   env: Readonly<Record<string, string | undefined>> = process.env,
   logger: Logger = createJsonLogger(),
 ): Promise<RunningOrchestrator> {
   const config = loadConfig(env);
+  const now = (): number => Date.now();
+
+  const docker = new GvisorManager({ traefikContainer: config.traefikContainer, logger });
+  await docker.assertRunscAvailable();
+
+  const auth = new Authenticator({
+    settings:
+      config.authMode === "required"
+        ? {
+            mode: "required",
+            secret: config.authSecret,
+            users: config.authUsers,
+            tokenTtlMs: config.authTokenTtlMs,
+          }
+        : { mode: "disabled" },
+    logger,
+    now,
+  });
+  if (!auth.enabled) {
+    logger.warn("auth.disabled", {
+      message: "ORCHESTRATOR_AUTH_MODE=disabled: every caller shares one anonymous account. Development on loopback only.",
+    });
+  }
 
   const redis = createRedisClient(config.redisUrl, logger);
   await redis.connect();
 
   const store = new RedisSessionStore(redis, { keyPrefix: config.redisKeyPrefix, logger });
-  const docker = new DockerManager();
-  const now = (): number => Date.now();
 
   let reconcileReport: ReconcileReport;
   try {
     reconcileReport = await reconcile({ store, docker, logger, now, orphanPolicy: config.orphanPolicy });
+    const activeSessionIds = new Set((await store.list()).map((record) => record.sessionId));
+    const removedNetworks = await docker.pruneOrphanNetworks(activeSessionIds);
+    if (removedNetworks.length > 0) {
+      logger.warn("network.pruned_orphans", { networks: removedNetworks });
+    }
   } catch (error) {
     redis.disconnect();
     throw error;
   }
 
-  const ctx: ApiContext = { config, store, docker, logger, now };
+  const ctx: ApiContext = { config, store, docker, auth, logger, now };
   const server = createServer(createRequestHandler(ctx));
 
   await new Promise<void>((resolve, reject) => {
@@ -121,6 +171,8 @@ export async function startOrchestrator(
     port: config.port,
     hostSuffix: config.hostSuffix,
     orphanPolicy: config.orphanPolicy,
+    authMode: config.authMode,
+    runtime: "runsc",
   });
 
   let stopping: Promise<void> | undefined;

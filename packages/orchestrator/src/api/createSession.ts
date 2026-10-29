@@ -83,13 +83,21 @@ async function removeContainersForSession(ctx: ApiContext, sessionId: string): P
  *    untracked container, which the boot-time reconciler removes; a failure
  *    inside this function removes it right away.
  */
-export async function createSession(ctx: ApiContext): Promise<CreateSessionResponse> {
+export async function createSession(ctx: ApiContext, ownerId: string): Promise<CreateSessionResponse> {
   const existing = await ctx.store.list();
   if (existing.length >= ctx.config.maxSessions) {
     throw new ApiError(
       429,
       "capacity_reached",
       `Session limit reached (${ctx.config.maxSessions}); end a session and try again`,
+    );
+  }
+  const ownedCount = existing.filter((record) => record.ownerId === ownerId).length;
+  if (ownedCount >= ctx.config.maxSessionsPerUser) {
+    throw new ApiError(
+      429,
+      "user_capacity_reached",
+      `You already have ${ownedCount} sessions (limit ${ctx.config.maxSessionsPerUser}); end one and try again`,
     );
   }
 

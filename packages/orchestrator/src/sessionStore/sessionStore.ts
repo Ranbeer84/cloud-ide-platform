@@ -6,6 +6,11 @@ import type { ManagedContainerStatus } from "../containers/containerTypes.js";
  */
 export interface SessionRecord {
   readonly sessionId: string;
+  /**
+   * Id of the account that owns this session (Phase 7). Only the owner may
+   * read, heartbeat or end it. Immutable for the life of the session.
+   */
+  readonly ownerId: string;
   readonly containerId: string;
   readonly image: string;
   readonly hostAgentPort: number;
