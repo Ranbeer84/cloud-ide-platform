@@ -5,10 +5,11 @@ import { createRequestHandler } from "./api/routes.js";
 import { Authenticator } from "./auth/authMiddleware.js";
 import { loadConfig, type OrchestratorConfig } from "./config.js";
 import { GvisorManager } from "./containers/gvisorManager.js";
+import { HistoryRecordingSessionStore, loadPostgresOptions, PostgresDatabase } from "./db/postgres.js";
 import { IdleReaper } from "./idleReaper.js";
 import { reconcile, type ReconcileReport } from "./reconciler.js";
 import { createRedisClient, RedisSessionStore } from "./sessionStore/redisStore.js";
-import type { ApiContext, LogFields, Logger } from "./sessionStore/sessionTypes.js";
+import type { ApiContext, LogFields, Logger, OrchestratorSessionStore } from "./sessionStore/sessionTypes.js";
 
 // ---- Public library surface (imported by phase verification scripts) ----
 export { DockerManager } from "./containers/dockerManager.js";
@@ -55,6 +56,18 @@ export type {
   OrchestratorSessionStore,
   SessionView,
 } from "./sessionStore/sessionTypes.js";
+export { PostgresDatabase, HistoryRecordingSessionStore, loadPostgresOptions } from "./db/postgres.js";
+export type {
+  Account,
+  AccountSummary,
+  AuditEntry,
+  AuditEntryInput,
+  AuditQuery,
+  OwnerSessionStats,
+  PostgresOptions,
+  SessionHistoryEntry,
+  SessionHistoryQuery,
+} from "./db/postgres.js";
 export { loadConfig, ConfigError } from "./config.js";
 export type { OrchestratorConfig } from "./config.js";
 export { reconcile } from "./reconciler.js";
@@ -85,7 +98,42 @@ export interface RunningOrchestrator {
   readonly config: OrchestratorConfig;
   readonly server: Server;
   readonly reconcileReport: ReconcileReport;
+  /** Undefined when DATABASE_URL is not set. */
+  readonly database: PostgresDatabase | undefined;
   stop(): Promise<void>;
+}
+
+const DEFAULT_RECONCILE_GRACE_MS = 60_000;
+/**
+ * How long a stopping replica lets in-flight requests finish before it cuts
+ * them off. Must exceed SANDBOX_READY_TIMEOUT_MS (a POST /api/sessions can
+ * legitimately take that long), or a rolling restart would abort a session
+ * that is half created.
+ */
+const DEFAULT_SHUTDOWN_GRACE_MS = 30_000;
+
+function readShutdownGraceMs(env: Readonly<Record<string, string | undefined>>): number {
+  const raw = env["SHUTDOWN_GRACE_MS"]?.trim();
+  if (!raw) {
+    return DEFAULT_SHUTDOWN_GRACE_MS;
+  }
+  const parsed = Number(raw);
+  if (!/^\d+$/.test(raw) || parsed < 100 || parsed > 600_000) {
+    throw new Error(`SHUTDOWN_GRACE_MS must be an integer between 100 and 600000 (got "${raw}")`);
+  }
+  return parsed;
+}
+
+function readGraceMs(env: Readonly<Record<string, string | undefined>>): number {
+  const raw = env["RECONCILE_GRACE_MS"]?.trim();
+  if (!raw) {
+    return DEFAULT_RECONCILE_GRACE_MS;
+  }
+  const parsed = Number(raw);
+  if (!/^\d+$/.test(raw) || parsed > 3_600_000) {
+    throw new Error(`RECONCILE_GRACE_MS must be an integer between 0 and 3600000 (got "${raw}")`);
+  }
+  return parsed;
 }
 
 /**
@@ -93,16 +141,27 @@ export interface RunningOrchestrator {
  *  1. parse config                 - fail fast on bad env (including auth settings)
  *  2. require the gVisor runtime   - refuse to run sandboxes any other way
  *  3. connect to Redis             - fail fast if unreachable
+ *  3b. connect to Postgres         - only when DATABASE_URL is set; migrate, sync accounts
  *  4. reconcile Redis vs Docker    - heal crash drift BEFORE serving traffic
  *  5. prune orphaned networks      - per-session networks left behind by a crash
  *  6. start the HTTP API
  *  7. start the idle reaper
+ *
+ * Several replicas can run this at once against the same Redis, Postgres and
+ * Docker host. Step 4 is the delicate one: another replica may be in the
+ * middle of POST /api/sessions, with a container started but its record not
+ * yet written. That container looks exactly like an orphan, so containers
+ * younger than RECONCILE_GRACE_MS (default 60 s, longer than the sandbox
+ * readiness timeout) that have no record are left alone by this boot's
+ * reconcile and network prune. Orphans that are still there after the grace
+ * period are handled by the next boot or an operator, never by guesswork.
  */
 export async function startOrchestrator(
   env: Readonly<Record<string, string | undefined>> = process.env,
   logger: Logger = createJsonLogger(),
 ): Promise<RunningOrchestrator> {
   const config = loadConfig(env);
+  const shutdownGraceMs = readShutdownGraceMs(env);
   const now = (): number => Date.now();
 
   const docker = new GvisorManager({ traefikContainer: config.traefikContainer, logger });
@@ -130,18 +189,57 @@ export async function startOrchestrator(
   const redis = createRedisClient(config.redisUrl, logger);
   await redis.connect();
 
-  const store = new RedisSessionStore(redis, { keyPrefix: config.redisKeyPrefix, logger });
+  const redisStore = new RedisSessionStore(redis, { keyPrefix: config.redisKeyPrefix, logger });
 
+  let database: PostgresDatabase | undefined;
+  let store: OrchestratorSessionStore = redisStore;
   let reconcileReport: ReconcileReport;
   try {
-    reconcileReport = await reconcile({ store, docker, logger, now, orphanPolicy: config.orphanPolicy });
+    const graceMs = readGraceMs(env);
+
+    const databaseOptions = loadPostgresOptions(env, logger);
+    if (databaseOptions) {
+      database = await PostgresDatabase.connect(databaseOptions);
+      await database.migrate();
+      const synced = await database.syncAccounts(config.authUsers);
+      logger.info("postgres.accounts_synced", { accounts: synced });
+      store = new HistoryRecordingSessionStore(redisStore, database, logger, now);
+    }
+
+    // Containers that are too young to be judged are hidden from the
+    // reconciler unless a record already claims them (see the boot sequence).
+    const recordedContainerIds = new Set((await store.list()).map((record) => record.containerId));
+    const youngUnrecorded = new Set<string>();
+    const reconcilerDocker = {
+      stopContainer: docker.stopContainer.bind(docker),
+      async listManagedContainers() {
+        const all = await docker.listManagedContainers();
+        return all.filter((container) => {
+          const young = graceMs > 0 && now() - container.createdAt < graceMs;
+          if (young && !recordedContainerIds.has(container.containerId)) {
+            youngUnrecorded.add(container.sessionId);
+            return false;
+          }
+          return true;
+        });
+      },
+    };
+
+    reconcileReport = await reconcile({ store, docker: reconcilerDocker, logger, now, orphanPolicy: config.orphanPolicy });
+    if (youngUnrecorded.size > 0) {
+      logger.info("reconciler.skipped_young_containers", { sessionIds: [...youngUnrecorded], graceMs });
+    }
     const activeSessionIds = new Set((await store.list()).map((record) => record.sessionId));
+    for (const sessionId of youngUnrecorded) {
+      activeSessionIds.add(sessionId);
+    }
     const removedNetworks = await docker.pruneOrphanNetworks(activeSessionIds);
     if (removedNetworks.length > 0) {
       logger.warn("network.pruned_orphans", { networks: removedNetworks });
     }
   } catch (error) {
     redis.disconnect();
+    await database?.close().catch(() => undefined);
     throw error;
   }
 
@@ -173,6 +271,8 @@ export async function startOrchestrator(
     orphanPolicy: config.orphanPolicy,
     authMode: config.authMode,
     runtime: "runsc",
+    replicaId: env["REPLICA_ID"]?.trim() || "orchestrator",
+    database: database !== undefined,
   });
 
   let stopping: Promise<void> | undefined;
@@ -182,15 +282,16 @@ export async function startOrchestrator(
       await new Promise<void>((resolve) => {
         server.close(() => resolve());
         server.closeIdleConnections();
-        setTimeout(() => server.closeAllConnections(), 2_000).unref();
+        setTimeout(() => server.closeAllConnections(), shutdownGraceMs).unref();
       });
       await redis.quit().catch(() => redis.disconnect());
+      await database?.close().catch(() => undefined);
       logger.info("orchestrator.stopped");
     })();
     return stopping;
   };
 
-  return { config, server, reconcileReport, stop };
+  return { config, server, reconcileReport, database, stop };
 }
 
 function isMainModule(): boolean {
