@@ -1,0 +1,99 @@
+services:
+  streaming:
+    image: node:20-bookworm
+    working_dir: /repo
+    volumes:
+      - .:/repo
+      - streaming-node-modules:/repo/node_modules
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: "4000"
+      WEB_ORIGIN: "http://localhost:5173"
+    command: >
+      sh -c "corepack enable && corepack prepare pnpm@9.0.0 --activate &&
+      pnpm install --frozen-lockfile=false &&
+      pnpm --filter @live/streaming run dev"
+
+  web:
+    image: node:20-bookworm
+    working_dir: /repo
+    volumes:
+      - .:/repo
+      - web-node-modules:/repo/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_STREAMING_URL: "http://localhost:4000"
+    depends_on:
+      - streaming
+    command: >
+      sh -c "corepack enable && corepack prepare pnpm@9.0.0 --activate &&
+      pnpm install --frozen-lockfile=false &&
+      pnpm --filter @live/web run dev"
+
+  traefik:
+    image: traefik:v3.6.16
+    entrypoint: ["/bin/sh", "-c"]
+    # `$$` escapes compose interpolation so the shell (not compose) expands
+    # these at container start. acme.yml is appended to traefik.yml and its
+    # placeholders substituted, giving Traefik ONE static config file.
+    command:
+      - |
+        set -e
+        touch /letsencrypt/acme.json
+        chmod 600 /letsencrypt/acme.json
+        {
+          cat /etc/traefik/traefik.yml
+          echo
+          sed -e "s|__ACME_EMAIL__|$${ACME_EMAIL}|g" \
+              -e "s|__ACME_CA_SERVER__|$${ACME_CA_SERVER}|g" \
+              /etc/traefik/acme.yml
+        } > /etc/traefik/merged.yml
+        exec traefik --configFile=/etc/traefik/merged.yml
+    ports:
+      - "80:80"
+      - "443:443"
+      # Traefik dashboard/API (http://localhost:8080/dashboard/). Dev only --
+      # lock this down before exposing the host publicly (Phase 7).
+      - "8080:8080"
+    environment:
+      ACME_EMAIL: "${ACME_EMAIL:-dev@example.invalid}"
+      ACME_CA_SERVER: "${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+      # Read by Traefik's Cloudflare DNS-01 provider (not a TRAEFIK_* var).
+      CF_DNS_API_TOKEN: "${CF_DNS_API_TOKEN:-}"
+    volumes:
+      - ./packages/proxy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./packages/proxy/traefik/acme.yml:/etc/traefik/acme.yml:ro
+      - letsencrypt-storage:/letsencrypt
+      # Read-only: Traefik only watches container metadata.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - live-network
+
+  redis:
+    image: redis:7-alpine
+    # AOF persistence so session records survive a Redis restart too.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      # Loopback only: the orchestrator runs on the host and connects here.
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+
+volumes:
+  streaming-node-modules:
+  web-node-modules:
+  letsencrypt-storage:
+  redis-data:
+
+networks:
+  live-network:
+    name: live-network
+    external: true

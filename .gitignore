@@ -1,0 +1,19 @@
+# OS files
+.DS_Store
+*/.DS_Store
+*/*/.DS_Store
+
+# Dependencies & caches
+node_modules/
+.pnpm-store/
+.vite/
+
+# Build outputs & TypeScript build cache
+dist/
+*.tsbuildinfo
+
+# Local secrets / env
+.env
+
+# Verify-script temp files
+*.tmp.mjs

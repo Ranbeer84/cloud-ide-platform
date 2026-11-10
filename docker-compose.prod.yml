@@ -1,0 +1,385 @@
+# Phase 8: multi-replica stack on ONE Docker host.
+#
+#   2 orchestrator replicas  -> behind nginx (orchestrator-lb), shared Redis + Postgres
+#   2 streaming replicas     -> behind Traefik with a sticky cookie, Socket.IO over the Redis adapter
+#   1 Traefik                -> public entrypoint, also routes every <session-id> preview
+#   1 Redis, 1 Postgres      -> shared state; both on named volumes
+#
+# This file is self-contained. It does not extend docker-compose.yml, and it
+# uses its own project name, volumes and container names, so it can sit next
+# to the dev stack. Run it from the repository root:
+#
+#   bash scripts/ensure-proxy-network.sh
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Requirements: Docker Compose >= 2.23.1 (inline `configs: content`), the
+# gVisor runtime "runsc" registered with Docker (Phase 7), the sandbox image
+# built (scripts/seed-sandbox-image.sh), and the sandbox firewall applied
+# (scripts/apply-sandbox-firewall.sh apply).
+#
+# Required environment (compose refuses to start without them):
+#   POSTGRES_PASSWORD, REDIS_PASSWORD     URL-safe characters only (they go into URLs)
+#   ORCHESTRATOR_AUTH_SECRET              >= 32 characters
+#   ORCHESTRATOR_AUTH_USERS               JSON array of accounts (see Phase 7)
+#
+# Optional environment, with defaults:
+#   PROD_HTTP_PORT=80  PROD_HTTPS_PORT=443          Traefik's public ports
+#   STREAMING_HOST=streaming.localhost              hostname Traefik routes to the streaming replicas
+#   STREAMING_ENTRYPOINTS=web                       entrypoint of the streaming router
+#   WEB_ORIGIN=http://localhost:5173                browser origin allowed by CORS
+#   WEB_BASE_URL=http://localhost:5173              base of the hostUrl / viewerUrl the API returns
+#   SESSION_HOST_SUFFIX=.localhost                  routing suffix for previews (Phase 3/4)
+#   ORCHESTRATOR_LB_BIND=127.0.0.1                  address the orchestrator load balancer listens on
+#   ORCHESTRATOR_LB_PORT=4100  ORCHESTRATOR_1_PORT=4101  ORCHESTRATOR_2_PORT=4102
+#   STREAMING_1_PORT=4201  STREAMING_2_PORT=4202    loopback ports for per-replica diagnostics
+#   PROD_REDIS_PORT=6380  PROD_POSTGRES_PORT=5433   loopback ports (the orchestrators use them)
+#   PROXY_CONTAINER_NAME=live-prod-traefik          name of the Traefik container
+#   REDIS_KEY_PREFIX=live:  MAX_SESSIONS=50  MAX_SESSIONS_PER_USER=5
+#   SESSION_IDLE_TIMEOUT_MS=1800000  RECONCILE_GRACE_MS=60000
+#
+# HTTPS for the streaming hostname: this file only defines the plain-HTTP router
+# (an empty `tls.*` label would turn every router TLS-only, so none is emitted).
+# For a public deployment add, in a docker-compose.override.yml, to BOTH
+# streaming services:
+#   traefik.http.routers.live-streaming.entrypoints: websecure
+#   traefik.http.routers.live-streaming.tls.certresolver: letsencrypt
+# (the resolver name is the one defined in packages/proxy/traefik/acme.yml).
+#
+# Deploying new code: `docker compose up -d` re-runs `app-install`, which
+# replaces the code in the shared `app` volume. Replicas keep running the old
+# code until restarted, so roll them one at a time:
+#   docker compose -f docker-compose.prod.yml restart orchestrator-1
+#   (wait until it is healthy)
+#   docker compose -f docker-compose.prod.yml restart orchestrator-2
+# and the same for streaming-1 and streaming-2. Building images instead of
+# bind-mounting a copy of the source is the next step once this shape is stable.
+
+name: live-prod
+
+x-node-runtime: &node-runtime
+  image: node:20-bookworm
+  working_dir: /app
+  init: true
+  restart: unless-stopped
+
+# Both streaming replicas carry identical labels. Traefik merges containers
+# that declare the same service name into one load-balanced service.
+x-streaming-labels: &streaming-labels
+  traefik.enable: "true"
+  traefik.docker.network: "live-network"
+  traefik.http.routers.live-streaming.rule: "Host(`${STREAMING_HOST:-streaming.localhost}`)"
+  traefik.http.routers.live-streaming.entrypoints: "${STREAMING_ENTRYPOINTS:-web}"
+  traefik.http.routers.live-streaming.service: "live-streaming"
+  traefik.http.services.live-streaming.loadbalancer.server.port: "4000"
+  # Sticky cookie: Socket.IO's HTTP long-polling fallback needs every request
+  # of one session to reach the same replica. (The web client connects with
+  # WebSocket only, which is one persistent connection and needs no stickiness.)
+  traefik.http.services.live-streaming.loadbalancer.sticky.cookie.name: "live_stream_node"
+  traefik.http.services.live-streaming.loadbalancer.sticky.cookie.httpOnly: "true"
+  traefik.http.services.live-streaming.loadbalancer.sticky.cookie.sameSite: "lax"
+  # A replica that is draining answers /health with 503 and is taken out of
+  # rotation within one interval; sockets already open on it are not cut.
+  traefik.http.services.live-streaming.loadbalancer.healthcheck.path: "/health"
+  traefik.http.services.live-streaming.loadbalancer.healthcheck.interval: "2s"
+  traefik.http.services.live-streaming.loadbalancer.healthcheck.timeout: "1s"
+
+x-streaming-env: &streaming-env
+  PORT: "4000"
+  WEB_ORIGIN: "${WEB_ORIGIN:-http://localhost:5173}"
+  REDIS_URL: "redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379"
+  REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX:-live:}"
+  CLUSTER_PEER_TIMEOUT_MS: "2000"
+  # Stay unhealthy for 5 s (more than two Traefik health intervals) before
+  # disconnecting clients, so new connections already go to the other replica.
+  SHUTDOWN_DRAIN_MS: "5000"
+
+x-orchestrator-env: &orchestrator-env
+  ORCHESTRATOR_HOST: "127.0.0.1"
+  REDIS_URL: "redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@127.0.0.1:${PROD_REDIS_PORT:-6380}"
+  REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX:-live:}"
+  DATABASE_URL: "postgres://live:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@127.0.0.1:${PROD_POSTGRES_PORT:-5433}/live"
+  # The agent port of every sandbox is published on the host's loopback only
+  # (Phase 7), which a container reaches only through the host network. That
+  # is why the orchestrators use `network_mode: host`.
+  SANDBOX_AGENT_HOST: "127.0.0.1"
+  TRAEFIK_CONTAINER: "${PROXY_CONTAINER_NAME:-live-prod-traefik}"
+  ORCHESTRATOR_AUTH_MODE: "required"
+  ORCHESTRATOR_AUTH_SECRET: "${ORCHESTRATOR_AUTH_SECRET:?set ORCHESTRATOR_AUTH_SECRET}"
+  ORCHESTRATOR_AUTH_USERS: "${ORCHESTRATOR_AUTH_USERS:?set ORCHESTRATOR_AUTH_USERS}"
+  WEB_BASE_URL: "${WEB_BASE_URL:-http://localhost:5173}"
+  SESSION_HOST_SUFFIX: "${SESSION_HOST_SUFFIX:-.localhost}"
+  MAX_SESSIONS: "${MAX_SESSIONS:-50}"
+  MAX_SESSIONS_PER_USER: "${MAX_SESSIONS_PER_USER:-5}"
+  SESSION_IDLE_TIMEOUT_MS: "${SESSION_IDLE_TIMEOUT_MS:-1800000}"
+  # A replica booting must not mistake a session another replica is still
+  # creating for an orphan (see startOrchestrator in packages/orchestrator/src/index.ts).
+  RECONCILE_GRACE_MS: "${RECONCILE_GRACE_MS:-60000}"
+  # In-flight requests may finish for this long when a replica is stopped.
+  SHUTDOWN_GRACE_MS: "30000"
+
+services:
+  # One-shot: copies the code into the shared `app` volume and installs
+  # production dependencies there, so nothing is written into your checkout
+  # and the replicas never race each other installing packages.
+  app-install:
+    image: node:20-bookworm
+    working_dir: /app
+    volumes:
+      - .:/src:ro
+      - app:/app
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        find /app -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        tar -C /src \
+          --exclude=./node_modules --exclude='./packages/*/node_modules' \
+          --exclude=./.git --exclude=./phases --exclude=./infra -cf - . | tar -C /app -xf -
+        corepack enable
+        corepack prepare pnpm@9.0.0 --activate
+        pnpm install --frozen-lockfile --prod \
+          --filter "@live/streaming..." --filter "@live/orchestrator..."
+    restart: "no"
+    networks:
+      - data
+
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --requirepass
+      - "${REDIS_PASSWORD:?set REDIS_PASSWORD}"
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+    ports:
+      - "127.0.0.1:${PROD_REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+    networks:
+      - data
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: live
+      POSTGRES_DB: live
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
+    ports:
+      - "127.0.0.1:${PROD_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U live -d live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks:
+      - data
+
+  traefik:
+    image: traefik:v3.1
+    container_name: "${PROXY_CONTAINER_NAME:-live-prod-traefik}"
+    entrypoint: ["/bin/sh", "-c"]
+    # Same startup as the dev stack: acme.yml is appended to traefik.yml and its
+    # placeholders substituted, giving Traefik one static config file.
+    command:
+      - |
+        set -e
+        touch /letsencrypt/acme.json
+        chmod 600 /letsencrypt/acme.json
+        {
+          cat /etc/traefik/traefik.yml
+          echo
+          sed -e "s|__ACME_EMAIL__|$${ACME_EMAIL}|g" \
+              -e "s|__ACME_CA_SERVER__|$${ACME_CA_SERVER}|g" \
+              /etc/traefik/acme.yml
+        } > /etc/traefik/merged.yml
+        exec traefik --configFile=/etc/traefik/merged.yml
+    ports:
+      - "${PROD_HTTP_PORT:-80}:80"
+      - "${PROD_HTTPS_PORT:-443}:443"
+      # The dashboard port (8080) is deliberately NOT published here.
+    environment:
+      ACME_EMAIL: "${ACME_EMAIL:-dev@example.invalid}"
+      ACME_CA_SERVER: "${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+      CF_DNS_API_TOKEN: "${CF_DNS_API_TOKEN:-}"
+    volumes:
+      - ./packages/proxy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./packages/proxy/traefik/acme.yml:/etc/traefik/acme.yml:ro
+      - letsencrypt-storage:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    networks:
+      - live-network
+
+  streaming-1:
+    <<: *node-runtime
+    command: ["node", "packages/streaming/dist/server.js"]
+    environment:
+      <<: *streaming-env
+      STREAMING_NODE_ID: "streaming-1"
+    labels: *streaming-labels
+    ports:
+      - "127.0.0.1:${STREAMING_1_PORT:-4201}:4000"
+    volumes:
+      - app:/app:ro
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    depends_on:
+      app-install:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - live-network
+      - data
+
+  streaming-2:
+    <<: *node-runtime
+    command: ["node", "packages/streaming/dist/server.js"]
+    environment:
+      <<: *streaming-env
+      STREAMING_NODE_ID: "streaming-2"
+    labels: *streaming-labels
+    ports:
+      - "127.0.0.1:${STREAMING_2_PORT:-4202}:4000"
+    volumes:
+      - app:/app:ro
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    depends_on:
+      app-install:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - live-network
+      - data
+
+  orchestrator-1:
+    <<: *node-runtime
+    network_mode: host
+    command: ["node", "packages/orchestrator/dist/index.js"]
+    environment:
+      <<: *orchestrator-env
+      ORCHESTRATOR_PORT: "${ORCHESTRATOR_1_PORT:-4101}"
+      REPLICA_ID: "orchestrator-1"
+    volumes:
+      - app:/app:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-m", "2", "http://127.0.0.1:${ORCHESTRATOR_1_PORT:-4101}/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      app-install:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      traefik:
+        condition: service_started
+
+  orchestrator-2:
+    <<: *node-runtime
+    network_mode: host
+    command: ["node", "packages/orchestrator/dist/index.js"]
+    environment:
+      <<: *orchestrator-env
+      ORCHESTRATOR_PORT: "${ORCHESTRATOR_2_PORT:-4102}"
+      REPLICA_ID: "orchestrator-2"
+    volumes:
+      - app:/app:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-m", "2", "http://127.0.0.1:${ORCHESTRATOR_2_PORT:-4102}/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      app-install:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      traefik:
+        condition: service_started
+
+  # Round-robin in front of the orchestrator replicas. A replica that refuses
+  # connections (stopping, or still booting) is skipped for 2 s, and a request
+  # that never reached it is retried on the other replica. A request that was
+  # already sent is never replayed, so a POST cannot create two sessions.
+  orchestrator-lb:
+    image: nginx:1.27-alpine
+    network_mode: host
+    configs:
+      - source: orchestrator-lb.conf
+        target: /etc/nginx/conf.d/default.conf
+    depends_on:
+      orchestrator-1:
+        condition: service_started
+      orchestrator-2:
+        condition: service_started
+    restart: unless-stopped
+
+configs:
+  orchestrator-lb.conf:
+    content: |
+      upstream orchestrators {
+        server 127.0.0.1:${ORCHESTRATOR_1_PORT:-4101} max_fails=1 fail_timeout=2s;
+        server 127.0.0.1:${ORCHESTRATOR_2_PORT:-4102} max_fails=1 fail_timeout=2s;
+      }
+      server {
+        listen ${ORCHESTRATOR_LB_BIND:-127.0.0.1}:${ORCHESTRATOR_LB_PORT:-4100};
+        location / {
+          proxy_pass http://orchestrators;
+          proxy_http_version 1.1;
+          proxy_set_header Host $$host;
+          proxy_set_header X-Forwarded-For $$remote_addr;
+          proxy_set_header Connection "";
+          proxy_connect_timeout 1s;
+          proxy_read_timeout 60s;
+          proxy_next_upstream error timeout http_502 http_503;
+          proxy_next_upstream_tries 2;
+        }
+      }
+
+volumes:
+  app:
+  redis-data:
+  postgres-data:
+  letsencrypt-storage:
+
+networks:
+  # Created once by scripts/ensure-proxy-network.sh. Sandboxes, Traefik and
+  # the streaming replicas meet here.
+  live-network:
+    name: live-network
+    external: true
+  data:
+    driver: bridge
