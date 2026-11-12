@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "packageManager": "pnpm@9.0.0",
   "scripts": {
-    "build": "pnpm -r --workspace-concurrency=1 run build",
+    "build": "find packages -maxdepth 2 -name '*.tsbuildinfo' -delete && pnpm -r --workspace-concurrency=1 run build",
     "dev": "pnpm --parallel -r run dev",
     "dev:streaming": "pnpm --filter @live/streaming run dev",
     "dev:web": "pnpm --filter @live/web run dev",

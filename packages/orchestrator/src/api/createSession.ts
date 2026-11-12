@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { ManagedContainer } from "../containers/containerTypes.js";
+import { describeError, isTransientSpawnError } from "../containers/errorDetails.js";
 import type { SessionRecord } from "../sessionStore/sessionStore.js";
 import {
   ApiError,
@@ -11,6 +12,9 @@ import {
 const READY_POLL_INTERVAL_MS = 250;
 const READY_PROBE_TIMEOUT_MS = 1_000;
 const ID_GENERATION_ATTEMPTS = 5;
+/** Total tries for the container spawn, and the pause before each retry. */
+const SPAWN_ATTEMPTS = 3;
+const SPAWN_RETRY_DELAYS_MS: readonly number[] = [250, 750];
 
 /** 16 hex chars after an "s": a valid DNS label, unguessable enough for a dev control plane. */
 function generateSessionId(): string {
@@ -111,28 +115,43 @@ export async function createSession(ctx: ApiContext, ownerId: string): Promise<C
     );
   }
 
-  const sessionId = await generateUniqueSessionId(ctx);
+  let sessionId = await generateUniqueSessionId(ctx);
 
-  let container: ManagedContainer;
-  try {
-    container = await ctx.docker.spawnContainer({
-      image: ctx.config.sandboxImage,
-      sessionId,
-      agentPort: ctx.config.sandboxAgentPort,
-      resourceLimits: {
-        memoryBytes: ctx.config.sandboxMemoryBytes,
-        nanoCpus: ctx.config.sandboxNanoCpus,
-        pidsLimit: ctx.config.sandboxPidsLimit,
-      },
-      env: { PORT: String(ctx.config.sandboxAgentPort) },
-    });
-  } catch (error) {
-    ctx.logger.error("session.spawn_failed", {
-      sessionId,
-      message: error instanceof Error ? error.message : String(error),
-    });
-    await removeContainersForSession(ctx, sessionId);
-    throw new ApiError(502, "spawn_failed", "Failed to start the sandbox container");
+  // Concurrent container and network churn on the shared Docker host (another
+  // replica booting, a session being torn down) can make one attempt fail in a
+  // way that clears by itself. Retry only those, with a fresh session id so the
+  // retry gets a fresh network and container name. Anything else fails at once.
+  let container: ManagedContainer | undefined;
+  for (let attempt = 1; container === undefined; attempt += 1) {
+    try {
+      container = await ctx.docker.spawnContainer({
+        image: ctx.config.sandboxImage,
+        sessionId,
+        agentPort: ctx.config.sandboxAgentPort,
+        resourceLimits: {
+          memoryBytes: ctx.config.sandboxMemoryBytes,
+          nanoCpus: ctx.config.sandboxNanoCpus,
+          pidsLimit: ctx.config.sandboxPidsLimit,
+        },
+        env: { PORT: String(ctx.config.sandboxAgentPort) },
+      });
+    } catch (error) {
+      const transient = isTransientSpawnError(error);
+      const willRetry = transient && attempt < SPAWN_ATTEMPTS;
+      const fields = { sessionId, attempt, attempts: SPAWN_ATTEMPTS, transient, ...describeError(error) };
+      if (willRetry) {
+        ctx.logger.warn("session.spawn_retry", fields);
+      } else {
+        ctx.logger.error("session.spawn_failed", fields);
+      }
+      await removeContainersForSession(ctx, sessionId);
+      if (!willRetry) {
+        throw new ApiError(502, "spawn_failed", "Failed to start the sandbox container");
+      }
+      const delayMs = SPAWN_RETRY_DELAYS_MS[attempt - 1] ?? SPAWN_RETRY_DELAYS_MS[SPAWN_RETRY_DELAYS_MS.length - 1] ?? 250;
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      sessionId = await generateUniqueSessionId(ctx);
+    }
   }
 
   const ready = await waitForAgentReady(ctx, container.hostAgentPort);

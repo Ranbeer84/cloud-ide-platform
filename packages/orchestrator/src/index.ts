@@ -233,7 +233,9 @@ export async function startOrchestrator(
     for (const sessionId of youngUnrecorded) {
       activeSessionIds.add(sessionId);
     }
-    const removedNetworks = await docker.pruneOrphanNetworks(activeSessionIds);
+    // Same grace as containers: a network younger than this may belong to a
+    // POST /api/sessions on another replica that has not written its record yet.
+    const removedNetworks = await docker.pruneOrphanNetworks(activeSessionIds, { graceMs });
     if (removedNetworks.length > 0) {
       logger.warn("network.pruned_orphans", { networks: removedNetworks });
     }

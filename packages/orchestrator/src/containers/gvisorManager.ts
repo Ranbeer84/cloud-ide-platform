@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import Docker from "dockerode";
 import type { ManagedContainer, SpawnContainerOptions, StopContainerOptions } from "./containerTypes.js";
 import { DockerManager } from "./dockerManager.js";
+import { describeError } from "./errorDetails.js";
 import { computeProxyLabels, DEFAULT_PROXY_TARGET_PORT, getHostSuffixFromEnv } from "./proxyLabels.js";
 import type { Logger } from "../sessionStore/sessionTypes.js";
 
@@ -32,6 +33,19 @@ export function sessionNetworkName(sessionId: string): string {
 export function sessionBridgeName(sessionId: string): string {
   const digest = createHash("sha256").update(sessionId).digest("hex").slice(0, 8);
   return `${SANDBOX_BRIDGE_PREFIX}${digest}`;
+}
+
+export interface PruneNetworksOptions {
+  /**
+   * Networks younger than this are left alone. POST /api/sessions creates a
+   * session's network BEFORE its container, and writes the session record only
+   * after the sandbox answers, so for about a second a perfectly healthy
+   * network has no container and no record. Without a grace period a replica
+   * that boots in that window deletes it and the spawn fails. 0 disables it.
+   */
+  readonly graceMs?: number;
+  /** Clock override for tests. */
+  readonly now?: () => number;
 }
 
 export interface GvisorManagerOptions {
@@ -104,10 +118,11 @@ export class GvisorManager extends DockerManager {
 
   override async spawnContainer(options: SpawnContainerOptions): Promise<ManagedContainer> {
     const networkName = sessionNetworkName(options.sessionId);
-    await this.createSessionNetwork(options.sessionId, networkName);
 
     let containerId: string | undefined;
     try {
+      await this.createSessionNetwork(options.sessionId, networkName);
+
       const labels: Record<string, string> = {
         // Caller labels first, so they can never overwrite routing or bookkeeping labels.
         ...(options.labels ?? {}),
@@ -172,12 +187,50 @@ export class GvisorManager extends DockerManager {
         status: "running",
       };
     } catch (error) {
+      await this.logSpawnFailure(options.sessionId, networkName, containerId, error);
       if (containerId !== undefined) {
         await super.stopContainer(containerId, { timeoutSeconds: 1 }).catch(() => undefined);
       }
       await this.removeSessionNetworks(options.sessionId);
       throw error;
     }
+  }
+
+  /**
+   * Records everything Docker/containerd/runsc told us about a failed spawn
+   * BEFORE the container is removed: the daemon's error text, the HTTP status,
+   * and (if the container was created) its exit code, state error and the last
+   * lines of its output. Best effort; never throws.
+   */
+  private async logSpawnFailure(
+    sessionId: string,
+    networkName: string,
+    containerId: string | undefined,
+    error: unknown,
+  ): Promise<void> {
+    const fields: Record<string, unknown> = { sessionId, network: networkName, runtime: SANDBOX_RUNTIME, ...describeError(error) };
+    if (containerId !== undefined) {
+      fields["containerId"] = containerId;
+      try {
+        const container = this.engine.getContainer(containerId);
+        const state = (await container.inspect()).State as {
+          Status?: string;
+          ExitCode?: number;
+          Error?: string;
+          OOMKilled?: boolean;
+        };
+        fields["containerState"] = state.Status;
+        fields["containerExitCode"] = state.ExitCode;
+        fields["containerStateError"] = state.Error;
+        fields["containerOomKilled"] = state.OOMKilled;
+        const output = await container.logs({ stdout: true, stderr: true, tail: 20 });
+        // eslint-disable-next-line no-control-regex
+        fields["containerOutputTail"] = output.toString("utf8").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").slice(-2000);
+      } catch (inspectError) {
+        fields["inspectFailed"] = messageOf(inspectError);
+      }
+    }
+    this.logger?.error("container.spawn_failed", fields);
   }
 
   override async stopContainer(containerId: string, options: StopContainerOptions = {}): Promise<void> {
@@ -203,15 +256,29 @@ export class GvisorManager extends DockerManager {
    * sessions not in `activeSessionIds`. Run once at boot, after the
    * reconciler, to clean up after a crash. Returns the names removed.
    */
-  async pruneOrphanNetworks(activeSessionIds: ReadonlySet<string>): Promise<readonly string[]> {
+  async pruneOrphanNetworks(
+    activeSessionIds: ReadonlySet<string>,
+    options: PruneNetworksOptions = {},
+  ): Promise<readonly string[]> {
+    const graceMs = options.graceMs ?? 0;
+    const nowMs = (options.now ?? Date.now)();
     const networks = await this.engine.listNetworks({ filters: { label: [`${MANAGED_LABEL_KEY}=true`] } });
     const traefikId = await this.findTraefikContainerId();
     const removed: string[] = [];
+    const skippedYoung: string[] = [];
 
     for (const summary of networks) {
       const sessionId = summary.Labels?.[SESSION_LABEL_KEY];
       if (sessionId === undefined || activeSessionIds.has(sessionId)) {
         continue;
+      }
+      if (graceMs > 0) {
+        const createdAt = Date.parse(String(summary.Created ?? ""));
+        // An unreadable timestamp is treated as "too young to judge": never delete on a guess.
+        if (Number.isNaN(createdAt) || nowMs - createdAt < graceMs) {
+          skippedYoung.push(summary.Name);
+          continue;
+        }
       }
       try {
         const details = await this.engine.getNetwork(summary.Id).inspect();
@@ -224,6 +291,9 @@ export class GvisorManager extends DockerManager {
       } catch (error) {
         this.logger?.warn("network.prune_failed", { network: summary.Name, message: messageOf(error) });
       }
+    }
+    if (skippedYoung.length > 0) {
+      this.logger?.info("network.skipped_young", { networks: skippedYoung, graceMs });
     }
     return removed;
   }

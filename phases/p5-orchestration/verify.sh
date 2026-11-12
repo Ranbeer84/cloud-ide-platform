@@ -121,6 +121,7 @@ start_orchestrator() {
       SESSION_IDLE_TIMEOUT_MS="$2" \
       IDLE_REAPER_INTERVAL_MS="$3" \
       RECONCILER_ORPHAN_POLICY="kill" \
+      RECONCILE_GRACE_MS="${P5_RECONCILE_GRACE_MS:-0}" \
       WEB_BASE_URL="http://localhost:5173" \
       node packages/orchestrator/dist/index.js
   ) >> "$1" 2>&1 &

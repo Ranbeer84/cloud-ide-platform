@@ -15,6 +15,7 @@
  *   REDIS_URL, REDIS_KEY_PREFIX         Redis URL and key prefix (store mode)
  *   RESTART_DB_CMD                      shell command that restarts Postgres (postgres mode, optional)
  */
+import http from "node:http";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -94,9 +95,30 @@ function waitFor(socket, event, predicate = () => true, timeoutMs = 5000) {
   });
 }
 
-async function health(url, hostHeader) {
-  const response = await fetch(`${url}/health`, { headers: hostHeader ? { Host: hostHeader } : {} });
-  return { status: response.status, body: await response.json() };
+// Node's built-in fetch (undici) silently drops a custom Host header, so Traefik
+// would see 127.0.0.1 and answer 404. node:http sends it as given.
+function health(url, hostHeader) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      `${url}/health`,
+      { method: "GET", headers: hostHeader ? { Host: hostHeader } : {} },
+      (response) => {
+        let data = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => (data += chunk));
+        response.on("end", () => {
+          try {
+            resolve({ status: response.statusCode ?? 0, body: JSON.parse(data) });
+          } catch {
+            reject(new Error(`GET ${url}/health -> ${response.statusCode}, not JSON: ${data.slice(0, 80)}`));
+          }
+        });
+      },
+    );
+    request.setTimeout(5000, () => request.destroy(new Error(`GET ${url}/health timed out`)));
+    request.on("error", reject);
+    request.end();
+  });
 }
 
 const TREE = {

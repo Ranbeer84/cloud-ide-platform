@@ -1,19 +1,70 @@
-# OS files
-.DS_Store
-*/.DS_Store
-*/*/.DS_Store
 
-# Dependencies & caches
+# ==========================================
+# OS files
+# ==========================================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Desktop.ini
+
+# ==========================================
+# Node.js dependencies
+# ==========================================
 node_modules/
 .pnpm-store/
-.vite/
+.pnp.*
 
-# Build outputs & TypeScript build cache
+# ==========================================
+# Build outputs and caches
+# ==========================================
 dist/
 *.tsbuildinfo
+.turbo/
+.vite/
+.next/
+coverage/
 
-# Local secrets / env
-.env
-
-# Verify-script temp files
+# ==========================================
+# Logs and temporary files
+# ==========================================
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+*.tmp
 *.tmp.mjs
+*.pid
+
+# ==========================================
+# Environment variables and secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ==========================================
+# Test artifacts
+# ==========================================
+playwright-report/
+test-results/
+
+# ==========================================
+# Local runtime data
+# ==========================================
+logs/

@@ -191,8 +191,19 @@ COMPOSE_LOGS_ON_FAIL=1
 $COMPOSE config -q > "$LOG_DIR/config.log" 2>&1 \
   && pass "docker-compose.prod.yml is valid" \
   || { cat "$LOG_DIR/config.log"; fail "docker-compose.prod.yml is not valid"; }
+SERVICES_LOG="$LOG_DIR/services.log"
+
+if ! $COMPOSE config --services > "$SERVICES_LOG" 2>&1; then
+  echo "Docker Compose service discovery failed:"
+  cat "$SERVICES_LOG"
+  fail "docker compose config --services failed"
+fi
+
+echo "Discovered Compose services:"
+cat "$SERVICES_LOG"
+
 for expected in orchestrator-1 orchestrator-2 streaming-1 streaming-2 redis postgres traefik orchestrator-lb; do
-  $COMPOSE config --services | grep -qx "$expected" || fail "service $expected is missing from docker-compose.prod.yml"
+  grep -Fxq "$expected" "$SERVICES_LOG" || fail "service $expected is missing from docker-compose.prod.yml"
 done
 pass "the stack defines 2 orchestrator replicas, 2 streaming replicas, Traefik, a load balancer, Redis and Postgres"
 

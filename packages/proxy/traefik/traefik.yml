@@ -17,8 +17,14 @@ entryPoints:
   websecure:
     address: ":443"
   # Traefik's own dashboard/API entrypoint (see `api` block below).
+  # Phase 7: this is deliberately NOT 8080. Traefik joins every session's
+  # network, so this port is reachable from inside each sandbox, and the API
+  # lists every session's hostname. 8080 is also the sandbox preview port, so
+  # the host firewall could not tell the two apart; 9000 can be blocked
+  # outright between containers (scripts/apply-sandbox-firewall.sh, TRAEFIK_API_PORT).
+  # docker-compose.yml still publishes it on the host as 127.0.0.1:8080.
   traefik:
-    address: ":8080"
+    address: ":9000"
 
 providers:
   docker:

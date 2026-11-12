@@ -11,11 +11,14 @@
  *   B. the terminal (pty) still behaves correctly under runsc: tty allocation,
  *      window-size ioctls, termios modes, line-discipline signals, job
  *      control, UTF-8, bulk output, EOF
- *   C. a sandbox cannot connect to another sandbox, to the host through its
- *      bridge gateway or any of the host's addresses, or to metadata endpoints
+ *   C. a sandbox cannot connect to another sandbox, to Traefik's API (which
+ *      lists every session), to the host through its bridge gateway or any of
+ *      the host's addresses, or to metadata endpoints
  *   D. stopping a sandbox removes its network, and orphaned networks are pruned
  *
  * Environment: SANDBOX_IMAGE (default live/sandbox-base:latest)
+ *              P7_TRAEFIK_API_PORT (default 9000) must match traefik.yml
+ *              P7_REQUIRE_TRAEFIK=1 fails instead of skipping when Traefik is not running
  *              P7_METADATA_IP (optional) an address already assigned to the host's
  *              loopback to stand in for the metadata service, e.g. 169.254.169.254
  */
@@ -36,6 +39,7 @@ const IMAGE = process.env.SANDBOX_IMAGE ?? "live/sandbox-base:latest";
 const AGENT_PORT = 7777;
 const PROBE_TIMEOUT_MS = 3000;
 const METADATA_IP = process.env.P7_METADATA_IP ?? "169.254.169.254";
+const TRAEFIK_API_PORT = Number(process.env.P7_TRAEFIK_API_PORT ?? "9000");
 
 function pass(message) {
   console.log(`  PASS: ${message}`);
@@ -303,6 +307,25 @@ function hostLanAddress() {
 const networkField = (sandbox, field) =>
   docker("inspect", "-f", `{{(index .NetworkSettings.Networks "${sandbox.network}").${field}}}`, sandbox.containerId);
 
+/** Running Traefik container (the compose service "traefik"), the one GvisorManager attaches to session networks. */
+function findTraefikId() {
+  try {
+    return docker("ps", "-q", "--filter", "label=com.docker.compose.service=traefik", "--filter", "status=running").split("\n")[0] || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Traefik's address on a session network, or undefined if it is not attached. */
+function addressOnNetwork(containerId, network) {
+  try {
+    const ip = docker("inspect", "-f", `{{(index .NetworkSettings.Networks "${network}").IPAddress}}`, containerId);
+    return /^\d+\.\d+\.\d+\.\d+$/.test(ip) ? ip : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function runNetworkChecks(a, b) {
   const leaks = [];
   const expectBlocked = async (from, description, host, port, counter) => {
@@ -321,6 +344,31 @@ async function runNetworkChecks(a, b) {
   // Another sandbox, by its address on its own network.
   const bIp = networkField(b, "IPAddress");
   await expectBlocked(a, "sandbox A -> sandbox B's agent by container IP", bIp, AGENT_PORT);
+
+  // Traefik joins every session network, so a sandbox can reach it on its own bridge. Its API lists
+  // every session's hostname; it must not be reachable from a sandbox.
+  const traefikId = findTraefikId();
+  if (traefikId === undefined) {
+    if (process.env.P7_REQUIRE_TRAEFIK === "1") {
+      throw new Error("Traefik is not running, so the sandbox -> Traefik API check cannot be made. Start it: docker compose up -d traefik");
+    }
+    note("Traefik is not running; skipped the sandbox -> Traefik API check (verify.sh runs it with Traefik up)");
+  } else {
+    const traefikIp = addressOnNetwork(traefikId, a.network);
+    assert(traefikIp !== undefined, `control: Traefik is attached to the sandbox's network (${a.network})`);
+    const web = await probeFrom(a, traefikIp, 80);
+    assert(web === "CONNECTED", `control: the sandbox can reach Traefik's public entrypoint (${traefikIp}:80), so this probe path works`);
+    try {
+      docker("exec", traefikId, "wget", "-q", "-O", "/dev/null", `http://127.0.0.1:${TRAEFIK_API_PORT}/api/rawdata`);
+      pass(`control: Traefik's API is listening on port ${TRAEFIK_API_PORT} inside its container`);
+    } catch {
+      throw new Error(
+        `Traefik's API did not answer on port ${TRAEFIK_API_PORT} inside its container, so a "blocked" result below would prove nothing.\n` +
+          "  Check entryPoints.traefik.address in packages/proxy/traefik/traefik.yml and recreate Traefik: docker compose up -d --force-recreate traefik",
+      );
+    }
+    await expectBlocked(a, "sandbox -> Traefik API (would list every session)", traefikIp, TRAEFIK_API_PORT);
+  }
 
   // The host, through the bridge gateway.
   const gateway = networkField(a, "Gateway");

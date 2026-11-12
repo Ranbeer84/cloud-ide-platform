@@ -13,7 +13,10 @@
 #   see GvisorManager), so containers on any other Docker network are untouched.
 #     FORWARD (DOCKER-USER chain):
 #       - replies to connections a sandbox opened are allowed back
-#       - traffic that stays on the session's own bridge is allowed (Traefik <-> sandbox)
+#       - traffic that stays on the session's own bridge to Traefik's API port
+#         (TRAEFIK_API_PORT) is dropped: Traefik sits on every session network, and its
+#         API lists every session's hostname
+#       - other traffic that stays on the session's own bridge is allowed (Traefik <-> sandbox)
 #       - connections to link-local (metadata) and private address ranges are dropped
 #       - everything else, i.e. the public internet, is left to Docker's own rules
 #     INPUT (traffic addressed to the host itself):
@@ -27,6 +30,11 @@
 #   apply-sandbox-firewall.sh remove   delete exactly the rules this script added
 #   apply-sandbox-firewall.sh status   exit 0 if the rules are installed, 1 if not
 #
+# BRIDGE NETFILTER
+#   Traffic between two containers on the SAME bridge only passes through iptables
+#   when the br_netfilter kernel module is loaded and net.bridge.bridge-nf-call-iptables=1.
+#   "apply" loads and enables it; without it the Traefik API rule below would do nothing.
+#
 # LIMITS
 #   - iptables rules do not survive a reboot. Run "apply" at boot (a systemd unit
 #     ordered After=docker.service) or the sandboxes lose this protection.
@@ -38,6 +46,8 @@ TAG="live-sandbox-fw"
 BRIDGES="lsbx+"
 FORWARD_CHAIN="DOCKER-USER"
 INPUT_CHAIN="INPUT"
+# Must match entryPoints.traefik.address in packages/proxy/traefik/traefik.yml.
+TRAEFIK_API_PORT=9000
 BLOCKED_RANGES=(169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10)
 
 die() {
@@ -67,9 +77,19 @@ remove_rules() {
   done < <(tagged_rules)
 }
 
+enable_bridge_netfilter() {
+  if [ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    modprobe br_netfilter 2> /dev/null || die "could not load the br_netfilter kernel module (needed to filter traffic inside a bridge)"
+  fi
+  sysctl -q -w net.bridge.bridge-nf-call-iptables=1 > /dev/null \
+    || die "could not set net.bridge.bridge-nf-call-iptables=1"
+}
+
 apply_rules() {
   iptables -n -L "$FORWARD_CHAIN" > /dev/null 2>&1 \
     || die "chain $FORWARD_CHAIN does not exist; is Docker running?"
+
+  enable_bridge_netfilter
 
   # Start clean so repeated runs never stack duplicates or leave a stale order.
   remove_rules
@@ -78,14 +98,17 @@ apply_rules() {
   local position=1
   local range
   # --- FORWARD (DOCKER-USER), final order:
-  #   1 established/related -> RETURN
-  #   2 same session bridge -> RETURN
-  #   3.. blocked ranges    -> DROP
+  #   1 established/related            -> RETURN
+  #   2 same bridge, Traefik API port  -> DROP
+  #   3 same session bridge            -> RETURN
+  #   4.. blocked ranges               -> DROP
   for ((i = ${#BLOCKED_RANGES[@]} - 1; i >= 0; i--)); do
     range="${BLOCKED_RANGES[$i]}"
     iptables -I "$FORWARD_CHAIN" 1 -i "$BRIDGES" -d "$range" -m comment --comment "$TAG" -j DROP
   done
   iptables -I "$FORWARD_CHAIN" 1 -i "$BRIDGES" -o "$BRIDGES" -m comment --comment "$TAG" -j RETURN
+  iptables -I "$FORWARD_CHAIN" 1 -i "$BRIDGES" -o "$BRIDGES" -p tcp --dport "$TRAEFIK_API_PORT" \
+    -m comment --comment "$TAG" -j DROP
   iptables -I "$FORWARD_CHAIN" 1 -i "$BRIDGES" -m conntrack --ctstate ESTABLISHED,RELATED \
     -m comment --comment "$TAG" -j RETURN
 
@@ -101,10 +124,16 @@ apply_rules() {
 }
 
 status_rules() {
-  local expected_forward=$((${#BLOCKED_RANGES[@]} + 2))
+  local expected_forward=$((${#BLOCKED_RANGES[@]} + 3))
   local forward_count input_count
   forward_count="$(iptables -S "$FORWARD_CHAIN" 2> /dev/null | grep -c -- "--comment $TAG" || true)"
   input_count="$(iptables -S "$INPUT_CHAIN" 2> /dev/null | grep -c -- "--comment $TAG" || true)"
+  local bridge_nf
+  bridge_nf="$(cat /proc/sys/net/bridge/bridge-nf-call-iptables 2> /dev/null || echo 0)"
+  if [ "$bridge_nf" != "1" ]; then
+    echo "sandbox firewall: NOT effective (br_netfilter is not enabled; run: $0 apply)"
+    return 1
+  fi
   if [ "$forward_count" -eq "$expected_forward" ] && [ "$input_count" -eq 2 ]; then
     echo "sandbox firewall: installed ($forward_count forward rules, $input_count input rules)"
     return 0

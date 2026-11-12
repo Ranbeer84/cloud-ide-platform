@@ -481,7 +481,10 @@ export class PostgresDatabase {
     }
     const ordered = [...users].sort((a, b) => a.id.localeCompare(b.id));
     await this.inTransaction(async (client) => {
-      for (const user of ordered) {
+  // Serialize account synchronization across orchestrator replicas.
+  await client.query("SELECT pg_advisory_xact_lock(187009, 1)");
+
+  for (const user of ordered) {
         await client.query(
           `INSERT INTO accounts (id, username, password_hash)
            VALUES ($1, $2, $3)

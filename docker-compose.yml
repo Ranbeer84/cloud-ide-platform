@@ -54,9 +54,10 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      # Traefik dashboard/API (http://localhost:8080/dashboard/). Dev only --
-      # lock this down before exposing the host publicly (Phase 7).
-      - "8080:8080"
+      # Traefik dashboard/API at http://127.0.0.1:8080/dashboard/ (Traefik
+      # listens on 9000 inside the container; see traefik.yml). Loopback only
+      # on the host, so it is not reachable from the network.
+      - "127.0.0.1:8080:9000"
     environment:
       ACME_EMAIL: "${ACME_EMAIL:-dev@example.invalid}"
       ACME_CA_SERVER: "${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
