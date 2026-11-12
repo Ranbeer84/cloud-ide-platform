@@ -10,6 +10,7 @@ services:
     environment:
       PORT: "4000"
       WEB_ORIGIN: "http://localhost:5173"
+      REDIS_URL: "redis://redis:6379"
     command: >
       sh -c "corepack enable && corepack prepare pnpm@9.0.0 --activate &&
       pnpm install --frozen-lockfile=false &&
