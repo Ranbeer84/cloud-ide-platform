@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { clientKeyFromRequest, loadOwnedSession } from "../auth/authMiddleware.js";
+import { logDebug, withBindings } from "../logging.js";
+import type { ObservableApiContext } from "../metrics.js";
 import {
   ApiError,
   toSessionView,
-  type ApiContext,
   type EndSessionResponse,
   type HeartbeatResponse,
 } from "../sessionStore/sessionTypes.js";
@@ -13,9 +15,11 @@ import { terminateSession } from "./endSession.js";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 
 type Route =
   | { readonly name: "health" }
+  | { readonly name: "metrics" }
   | { readonly name: "login" }
   | { readonly name: "whoami" }
   | { readonly name: "createSession" }
@@ -41,6 +45,10 @@ function matchRoute(method: string, pathname: string): RouteMatch | undefined {
 
   if (path === "/healthz") {
     return { route: method === "GET" ? { name: "health" } : undefined, allowed: ["GET"] };
+  }
+
+  if (path === "/metrics") {
+    return { route: method === "GET" ? { name: "metrics" } : undefined, allowed: ["GET"] };
   }
 
   if (path === "/api/auth/login") {
@@ -101,7 +109,7 @@ function decodeSessionId(raw: string): string | undefined {
   return SESSION_ID_PATTERN.test(decoded) ? decoded : undefined;
 }
 
-function applyCors(ctx: ApiContext, req: IncomingMessage, res: ServerResponse): void {
+function applyCors(ctx: ObservableApiContext, req: IncomingMessage, res: ServerResponse): void {
   const origin = req.headers.origin;
   const { allowedOrigin } = ctx.config;
 
@@ -161,9 +169,23 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   return parsed as Record<string, unknown>;
 }
 
-/** Routes callable without a token: liveness probes and the login that issues tokens. */
+/**
+ * Routes callable without a user token: liveness probes, the login that issues
+ * tokens, and the Prometheus scrape (which has its own optional bearer token).
+ */
 function isPublicRoute(route: Route): boolean {
-  return route.name === "health" || route.name === "login";
+  return route.name === "health" || route.name === "login" || route.name === "metrics";
+}
+
+/** Probe traffic every few seconds would drown the log, so it is written at debug level. */
+function isProbeRoute(routeLabel: string): boolean {
+  return routeLabel === "health" || routeLabel === "metrics";
+}
+
+function resolveRequestId(req: IncomingMessage): string {
+  const supplied = req.headers["x-request-id"];
+  const candidate = Array.isArray(supplied) ? supplied[0] : supplied;
+  return candidate !== undefined && REQUEST_ID_PATTERN.test(candidate) ? candidate : randomUUID();
 }
 
 /** Reads a required, bounded string field from a parsed JSON body. */
@@ -176,7 +198,7 @@ function requireStringField(body: Record<string, unknown>, field: string): strin
 }
 
 async function dispatch(
-  ctx: ApiContext,
+  ctx: ObservableApiContext,
   route: Route,
   principal: Principal | undefined,
   req: IncomingMessage,
@@ -187,6 +209,24 @@ async function dispatch(
     const status = redisOk ? 200 : 503;
     sendJson(res, status, { status: redisOk ? "ok" : "degraded", redis: redisOk, time: ctx.now() });
     return status;
+  }
+
+  if (route.name === "metrics") {
+    const metrics = ctx.metrics;
+    if (!metrics) {
+      throw new ApiError(404, "metrics_disabled", "Metrics are not enabled on this orchestrator");
+    }
+    if (!metrics.isAuthorized(req.headers.authorization)) {
+      throw new ApiError(401, "unauthorized", "A valid metrics bearer token is required");
+    }
+    const payload = await metrics.render();
+    res.writeHead(200, {
+      "Content-Type": metrics.contentType,
+      "Content-Length": Buffer.byteLength(payload),
+      "Cache-Control": "no-store",
+    });
+    res.end(payload);
+    return 200;
   }
 
   if (route.name === "login") {
@@ -256,18 +296,23 @@ async function dispatch(
   }
 }
 
-async function handle(ctx: ApiContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(ctx: ObservableApiContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const startedAt = ctx.now();
   const method = (req.method ?? "GET").toUpperCase();
   let pathname = req.url ?? "/";
   let status = 500;
+  let routeLabel = "unmatched";
+  const requestId = resolveRequestId(req);
+  const log = withBindings(ctx.logger, { requestId });
 
   try {
+    res.setHeader("X-Request-Id", requestId);
     applyCors(ctx, req, res);
 
     pathname = new URL(req.url ?? "/", "http://orchestrator.local").pathname;
 
     if (method === "OPTIONS") {
+      routeLabel = "options";
       res.writeHead(204);
       res.end();
       status = 204;
@@ -276,9 +321,11 @@ async function handle(ctx: ApiContext, req: IncomingMessage, res: ServerResponse
 
     const match = matchRoute(method, pathname);
     if (!match) {
+      routeLabel = "not_found";
       throw new ApiError(404, "not_found", `No route for ${method} ${pathname}`);
     }
     if (!match.route) {
+      routeLabel = "method_not_allowed";
       status = 405;
       sendJson(
         res,
@@ -293,6 +340,7 @@ async function handle(ctx: ApiContext, req: IncomingMessage, res: ServerResponse
     // learns nothing beyond "401" about protected routes.
     const principal = isPublicRoute(match.route) ? undefined : ctx.auth.authenticate(req);
 
+    routeLabel = match.route.name;
     status = await dispatch(ctx, match.route, principal, req, res);
   } catch (error) {
     if (error instanceof ApiError) {
@@ -307,7 +355,7 @@ async function handle(ctx: ApiContext, req: IncomingMessage, res: ServerResponse
       }
     } else {
       status = 500;
-      ctx.logger.error("request.unhandled_error", {
+      log.error("request.unhandled_error", {
         method,
         pathname,
         message: error instanceof Error ? error.message : String(error),
@@ -317,7 +365,14 @@ async function handle(ctx: ApiContext, req: IncomingMessage, res: ServerResponse
       }
     }
   } finally {
-    ctx.logger.info("request", { method, pathname, status, durationMs: ctx.now() - startedAt });
+    const durationMs = ctx.now() - startedAt;
+    ctx.metrics?.observeRequest(routeLabel, method, status, durationMs / 1000);
+    const fields = { method, pathname, route: routeLabel, status, durationMs };
+    if (isProbeRoute(routeLabel)) {
+      logDebug(log, "request", fields);
+    } else {
+      log.info("request", fields);
+    }
   }
 }
 
@@ -325,6 +380,7 @@ async function handle(ctx: ApiContext, req: IncomingMessage, res: ServerResponse
  * Builds the node:http request listener for the orchestrator API.
  *
  *   GET    /healthz                       liveness + Redis connectivity      (public)
+ *   GET    /metrics                       Prometheus scrape (public, or METRICS_BEARER_TOKEN)
  *   POST   /api/auth/login                exchange credentials for a token   (public)
  *   GET    /api/auth/me                   who the token belongs to
  *   POST   /api/sessions                  spawn a sandbox owned by the caller
@@ -337,7 +393,7 @@ async function handle(ctx: ApiContext, req: IncomingMessage, res: ServerResponse
  * <token>` and answers 401 without it. A session that belongs to someone else
  * is indistinguishable from one that does not exist (404).
  */
-export function createRequestHandler(ctx: ApiContext): (req: IncomingMessage, res: ServerResponse) => void {
+export function createRequestHandler(ctx: ObservableApiContext): (req: IncomingMessage, res: ServerResponse) => void {
   return (req, res) => {
     void handle(ctx, req, res);
   };

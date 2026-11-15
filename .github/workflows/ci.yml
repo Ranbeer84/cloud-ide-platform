@@ -1,0 +1,126 @@
+name: CI
+
+# Every pull request, and every commit pushed to any branch.
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+# A newer run of the same branch or PR replaces an older one that is still going.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  # Lint, build, then type-check. `tsc --noEmit` in a package needs the
+  # declarations of the packages it references, so the build comes first.
+  static:
+    name: Lint, build, type-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # The pnpm version comes from "packageManager" in package.json.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (no 'any' in shared-types)
+        run: pnpm run lint:no-any
+
+      - name: Build every package
+        run: pnpm run build
+
+      - name: Type-check every package
+        run: pnpm run typecheck
+
+  # Everything in Phase 9 that needs no containers: the structured logger, /metrics
+  # through the real request handler, the Prometheus config, the alert rules and
+  # their unit tests, and the shape of this workflow. Fast feedback for most changes.
+  operability:
+    name: Operability (logging, metrics, alert rules)
+    needs: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      # promtool runs from the Prometheus image when it is not on PATH.
+      - name: Pull the Prometheus image (for promtool)
+        run: docker pull prom/prometheus:v2.54.1
+
+      - name: Phase 9 gate, without Docker-backed steps
+        env:
+          P9_SKIP_REGRESSION: "1"
+          P9_SKIP_STACK: "1"
+        run: bash phases/p9-operability/verify.sh
+
+  # The full regression suite: Phase 9, which runs Phase 8, which runs Phases 7 to 0
+  # on a real Docker host with gVisor (runsc), the sandbox firewall and a sandbox
+  # image. No skips. This is the job that must be green to merge.
+  regression:
+    name: Full regression (Phases 0-9)
+    needs: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      # Installs gVisor and registers runsc with Docker, loads br_netfilter and applies
+      # the sandbox firewall (Phase 7). Docker itself is already on the runner.
+      - name: Prepare the host (gVisor, firewall)
+        run: bash scripts/setup-linux-host.sh
+
+      # The sandbox image build never pulls its base image by itself.
+      - name: Build the sandbox image
+        run: |
+          docker pull node:20-bookworm
+          bash scripts/seed-sandbox-image.sh
+
+      - name: Pull the images the stack runs
+        run: |
+          docker pull redis:7-alpine
+          docker pull postgres:16-alpine
+          docker pull nginx:1.27-alpine
+          docker pull traefik:v3.1
+          docker pull prom/prometheus:v2.54.1
+
+      - name: Phase 9 gate (includes the Phase 0-8 regression)
+        env:
+          P7_APPLY_FIREWALL: "1"
+        run: bash phases/p9-operability/verify.sh
+
+      # The gates write their own logs under /tmp; keep them when a run fails.
+      - name: Upload gate logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-logs
+          path: |
+            /tmp/p*-verify.*/
+          if-no-files-found: ignore
+          retention-days: 7

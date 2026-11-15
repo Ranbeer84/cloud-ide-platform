@@ -1,0 +1,125 @@
+# Unit tests for alerts.yml. Run with:  promtool test rules infra/monitoring/alerts.test.yml
+# Series are sampled every 15s, matching prometheus.yml.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 15s
+
+tests:
+  # 95% of a 1-core quota (14.25 CPU-seconds per 15 s step) held for the whole run.
+  - interval: 15s
+    input_series:
+      - series: 'container_cpu_usage_seconds_total{name="sbx-a", container_label_live_session_id="sa"}'
+        values: "0+14.25x60"
+      - series: 'container_spec_cpu_quota{name="sbx-a", container_label_live_session_id="sa"}'
+        values: "100000+0x60"
+      - series: 'container_spec_cpu_period{name="sbx-a", container_label_live_session_id="sa"}'
+        values: "100000+0x60"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: SandboxContainerCpuHigh
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: SandboxContainerCpuHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              name: sbx-a
+              container_label_live_session_id: sa
+            exp_annotations:
+              summary: "Sandbox sa is using more than 90% of its CPU limit"
+              description: "Container sbx-a (session sa) has been above 90% of its CPU quota for 5 minutes (now 95%)."
+
+  # Busy for 3 minutes, then idle: never reaches 5 minutes above 90%.
+  - interval: 15s
+    input_series:
+      - series: 'container_cpu_usage_seconds_total{name="sbx-b", container_label_live_session_id="sb"}'
+        values: "0+14.25x12 171+0.15x60"
+      - series: 'container_spec_cpu_quota{name="sbx-b", container_label_live_session_id="sb"}'
+        values: "100000+0x72"
+      - series: 'container_spec_cpu_period{name="sbx-b", container_label_live_session_id="sb"}'
+        values: "100000+0x72"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SandboxContainerCpuHigh
+        exp_alerts: []
+
+  # 85% of the quota for a long time: under the threshold.
+  - interval: 15s
+    input_series:
+      - series: 'container_cpu_usage_seconds_total{name="sbx-c", container_label_live_session_id="sc"}'
+        values: "0+12.75x80"
+      - series: 'container_spec_cpu_quota{name="sbx-c", container_label_live_session_id="sc"}'
+        values: "100000+0x80"
+      - series: 'container_spec_cpu_period{name="sbx-c", container_label_live_session_id="sc"}'
+        values: "100000+0x80"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SandboxContainerCpuHigh
+        exp_alerts: []
+
+  # No quota (quota 0): a container with no CPU cap is never divided by zero or flagged.
+  - interval: 15s
+    input_series:
+      - series: 'container_cpu_usage_seconds_total{name="sbx-d", container_label_live_session_id="sd"}'
+        values: "0+60x60"
+      - series: 'container_spec_cpu_quota{name="sbx-d", container_label_live_session_id="sd"}'
+        values: "0+0x60"
+      - series: 'container_spec_cpu_period{name="sbx-d", container_label_live_session_id="sd"}'
+        values: "100000+0x60"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SandboxContainerCpuHigh
+        exp_alerts: []
+
+  # Idle timeout 1800 s. One session idle for 3000 s (< 3600 s, i.e. under 2x): no alert.
+  - interval: 15s
+    input_series:
+      - series: 'session_max_idle_seconds{replica="orchestrator-1"}'
+        values: "3000+0x40"
+      - series: 'session_idle_timeout_seconds{replica="orchestrator-1"}'
+        values: "1800+0x40"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: SessionIdlePastTwiceTimeout
+        exp_alerts: []
+
+  # Idle for 3700 s (> 3600 s, i.e. past 2x the timeout) for more than a minute: alert.
+  - interval: 15s
+    input_series:
+      - series: 'session_max_idle_seconds{replica="orchestrator-1"}'
+        values: "3700+0x40"
+      - series: 'session_idle_timeout_seconds{replica="orchestrator-1"}'
+        values: "1800+0x40"
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: SessionIdlePastTwiceTimeout
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: SessionIdlePastTwiceTimeout
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              replica: orchestrator-1
+            exp_annotations:
+              summary: "A session has been idle for more than twice the idle timeout"
+              description: "Replica orchestrator-1 sees a session idle for 1h 1m 40s (limit is 2x the idle timeout). The idle reaper should have ended it; look for idle_reaper.session_failed in the orchestrator logs."
+
+  # A scrape target that stays down for over a minute.
+  - interval: 15s
+    input_series:
+      - series: 'up{job="orchestrator", instance="127.0.0.1:4101", replica="orchestrator-1"}'
+        values: "1x4 0x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: OrchestratorDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: orchestrator
+              instance: "127.0.0.1:4101"
+              replica: orchestrator-1
+            exp_annotations:
+              summary: "Orchestrator replica orchestrator-1 cannot be scraped"
+              description: "Prometheus has not been able to scrape 127.0.0.1:4101 for 1 minute."

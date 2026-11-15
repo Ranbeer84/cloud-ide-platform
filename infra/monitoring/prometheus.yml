@@ -1,0 +1,58 @@
+# Prometheus scrape configuration for the live-session platform.
+#
+# Run Prometheus on the HOST network (or directly on the host). The Phase 8
+# orchestrator replicas use `network_mode: host` and listen on 127.0.0.1, which
+# a bridge-networked container cannot reach.
+#
+# Targets match docker-compose.prod.yml defaults:
+#   orchestrator-1  127.0.0.1:4101      orchestrator-2  127.0.0.1:4102
+#   streaming-1     127.0.0.1:4201      streaming-2     127.0.0.1:4202   (not scraped: no /metrics yet)
+#   cAdvisor        127.0.0.1:8081      run it with --port=8081 (8080 is taken by the Traefik dashboard in dev)
+#
+# If you set METRICS_BEARER_TOKEN on the orchestrators, add to the `orchestrator` job:
+#   authorization: { type: Bearer, credentials_file: /etc/prometheus/metrics_token }
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+
+# Resolved relative to this file.
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  # active_sessions, container_count, session_max_idle_seconds, request_duration_seconds.
+  # Both replicas read the same Redis, so active_sessions is identical on each:
+  # aggregate it with max(), not sum().
+  - job_name: orchestrator
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:4101"]
+        labels:
+          replica: orchestrator-1
+      - targets: ["127.0.0.1:4102"]
+        labels:
+          replica: orchestrator-2
+
+  # Per-container CPU of the sandboxes. Needs cAdvisor's Docker integration, which
+  # exposes each container label as container_label_<name> (live.session-id becomes
+  # container_label_live_session_id).
+  - job_name: cadvisor
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8081"]
+    # Keep only the series the alerts use, and only for sandbox containers, so
+    # session churn does not fill Prometheus with series about everything else.
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: container_(cpu_usage_seconds_total|spec_cpu_quota|spec_cpu_period|memory_working_set_bytes)
+        action: keep
+      - source_labels: [container_label_live_session_id]
+        regex: .+
+        action: keep

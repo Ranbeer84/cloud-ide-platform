@@ -7,9 +7,11 @@ import { loadConfig, type OrchestratorConfig } from "./config.js";
 import { GvisorManager } from "./containers/gvisorManager.js";
 import { HistoryRecordingSessionStore, loadPostgresOptions, PostgresDatabase } from "./db/postgres.js";
 import { IdleReaper } from "./idleReaper.js";
+import { createLoggerFromEnv } from "./logging.js";
+import { createOrchestratorMetrics, type ObservableApiContext, type OrchestratorMetrics } from "./metrics.js";
 import { reconcile, type ReconcileReport } from "./reconciler.js";
 import { createRedisClient, RedisSessionStore } from "./sessionStore/redisStore.js";
-import type { ApiContext, LogFields, Logger, OrchestratorSessionStore } from "./sessionStore/sessionTypes.js";
+import type { Logger, OrchestratorSessionStore } from "./sessionStore/sessionTypes.js";
 
 // ---- Public library surface (imported by phase verification scripts) ----
 export { DockerManager } from "./containers/dockerManager.js";
@@ -74,24 +76,19 @@ export { reconcile } from "./reconciler.js";
 export type { ReconcileReport } from "./reconciler.js";
 export { IdleReaper } from "./idleReaper.js";
 export { createRequestHandler } from "./api/routes.js";
+export { createLogger, createLoggerFromEnv, formatLogLine, isStructuredLogger } from "./logging.js";
+export type { LogLevel, LogSink, StructuredLogger } from "./logging.js";
+export { createOrchestratorMetrics, MetricsRegistry, METRICS_CONTENT_TYPE } from "./metrics.js";
+export type { ObservableApiContext, OrchestratorMetrics, OrchestratorMetricsDeps } from "./metrics.js";
 
 // ---- Control plane entrypoint ----
 
-/** One JSON object per line on stdout/stderr. Phase 9 swaps in a richer logger. */
-export function createJsonLogger(): Logger {
-  const write = (level: "info" | "warn" | "error", message: string, fields?: LogFields): void => {
-    const line = JSON.stringify({ ts: new Date().toISOString(), level, msg: message, ...(fields ?? {}) });
-    if (level === "info") {
-      process.stdout.write(`${line}\n`);
-    } else {
-      process.stderr.write(`${line}\n`);
-    }
-  };
-  return {
-    info: (message, fields) => write("info", message, fields),
-    warn: (message, fields) => write("warn", message, fields),
-    error: (message, fields) => write("error", message, fields),
-  };
+/**
+ * One JSON object per line (info/debug on stdout, warn/error on stderr). Kept under
+ * its Phase 5 name so existing callers work; the implementation is in logging.ts.
+ */
+export function createJsonLogger(env: Readonly<Record<string, string | undefined>> = process.env): Logger {
+  return createLoggerFromEnv(env);
 }
 
 export interface RunningOrchestrator {
@@ -100,6 +97,7 @@ export interface RunningOrchestrator {
   readonly reconcileReport: ReconcileReport;
   /** Undefined when DATABASE_URL is not set. */
   readonly database: PostgresDatabase | undefined;
+  readonly metrics: OrchestratorMetrics;
   stop(): Promise<void>;
 }
 
@@ -122,6 +120,20 @@ function readShutdownGraceMs(env: Readonly<Record<string, string | undefined>>):
     throw new Error(`SHUTDOWN_GRACE_MS must be an integer between 100 and 600000 (got "${raw}")`);
   }
   return parsed;
+}
+
+const MIN_METRICS_TOKEN_LENGTH = 16;
+
+/** METRICS_BEARER_TOKEN is optional; when set it must be long enough to be worth having. */
+function readMetricsToken(env: Readonly<Record<string, string | undefined>>): string | undefined {
+  const raw = env["METRICS_BEARER_TOKEN"]?.trim();
+  if (!raw) {
+    return undefined;
+  }
+  if (raw.length < MIN_METRICS_TOKEN_LENGTH) {
+    throw new Error(`METRICS_BEARER_TOKEN must be at least ${MIN_METRICS_TOKEN_LENGTH} characters`);
+  }
+  return raw;
 }
 
 function readGraceMs(env: Readonly<Record<string, string | undefined>>): number {
@@ -158,10 +170,11 @@ function readGraceMs(env: Readonly<Record<string, string | undefined>>): number 
  */
 export async function startOrchestrator(
   env: Readonly<Record<string, string | undefined>> = process.env,
-  logger: Logger = createJsonLogger(),
+  logger: Logger = createLoggerFromEnv(env, { replicaId: env["REPLICA_ID"]?.trim() || "orchestrator" }),
 ): Promise<RunningOrchestrator> {
   const config = loadConfig(env);
   const shutdownGraceMs = readShutdownGraceMs(env);
+  const metricsToken = readMetricsToken(env);
   const now = (): number => Date.now();
 
   const docker = new GvisorManager({ traefikContainer: config.traefikContainer, logger });
@@ -245,7 +258,18 @@ export async function startOrchestrator(
     throw error;
   }
 
-  const ctx: ApiContext = { config, store, docker, auth, logger, now };
+  const replicaId = env["REPLICA_ID"]?.trim() || "orchestrator";
+  const metrics = createOrchestratorMetrics({
+    store,
+    docker,
+    idleTimeoutMs: config.idleTimeoutMs,
+    now,
+    logger,
+    replicaId,
+    bearerToken: metricsToken,
+  });
+
+  const ctx: ObservableApiContext = { config, store, docker, auth, logger, now, metrics };
   const server = createServer(createRequestHandler(ctx));
 
   await new Promise<void>((resolve, reject) => {
@@ -273,8 +297,9 @@ export async function startOrchestrator(
     orphanPolicy: config.orphanPolicy,
     authMode: config.authMode,
     runtime: "runsc",
-    replicaId: env["REPLICA_ID"]?.trim() || "orchestrator",
+    replicaId,
     database: database !== undefined,
+    metricsAuth: metricsToken !== undefined,
   });
 
   let stopping: Promise<void> | undefined;
@@ -293,7 +318,7 @@ export async function startOrchestrator(
     return stopping;
   };
 
-  return { config, server, reconcileReport, database, stop };
+  return { config, server, reconcileReport, database, metrics, stop };
 }
 
 function isMainModule(): boolean {
@@ -309,7 +334,7 @@ function isMainModule(): boolean {
 }
 
 async function main(): Promise<void> {
-  const logger = createJsonLogger();
+  const logger = createLoggerFromEnv(process.env, { replicaId: process.env["REPLICA_ID"]?.trim() || "orchestrator" });
   try {
     const running = await startOrchestrator(process.env, logger);
 

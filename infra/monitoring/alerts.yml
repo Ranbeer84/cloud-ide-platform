@@ -1,0 +1,61 @@
+# Prometheus alert rules for the live-session platform.
+# Loaded by prometheus.yml; unit-tested by alerts.test.yml (promtool test rules).
+
+groups:
+  - name: sandbox-containers
+    rules:
+      # A sandbox is capped at SANDBOX_CPUS cores (docker --cpus, i.e. a CFS quota).
+      # Usage is measured against that cap, so "90%" means 90% of the container's own
+      # limit. Containers with no quota (quota 0) are skipped rather than divided by zero.
+      - alert: SandboxContainerCpuHigh
+        expr: |
+          sum by (container_label_live_session_id, name) (
+            rate(container_cpu_usage_seconds_total{container_label_live_session_id!=""}[1m])
+          )
+          /
+          sum by (container_label_live_session_id, name) (
+            (container_spec_cpu_quota{container_label_live_session_id!=""} > 0)
+            / container_spec_cpu_period{container_label_live_session_id!=""}
+          )
+          > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sandbox {{ $labels.container_label_live_session_id }} is using more than 90% of its CPU limit"
+          description: "Container {{ $labels.name }} (session {{ $labels.container_label_live_session_id }}) has been above 90% of its CPU quota for 5 minutes (now {{ $value | humanizePercentage }})."
+
+  - name: orchestrator
+    rules:
+      # The idle reaper ends a session after SESSION_IDLE_TIMEOUT_MS of silence, so a
+      # session older than twice that means the reaper is failing or stuck.
+      - alert: SessionIdlePastTwiceTimeout
+        expr: |
+          max by (replica) (session_max_idle_seconds)
+          > 2 * max by (replica) (session_idle_timeout_seconds)
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A session has been idle for more than twice the idle timeout"
+          description: "Replica {{ $labels.replica }} sees a session idle for {{ $value | humanizeDuration }} (limit is 2x the idle timeout). The idle reaper should have ended it; look for idle_reaper.session_failed in the orchestrator logs."
+
+      - alert: OrchestratorDown
+        expr: up{job="orchestrator"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Orchestrator replica {{ $labels.replica }} cannot be scraped"
+          description: "Prometheus has not been able to scrape {{ $labels.instance }} for 1 minute."
+
+      # The orchestrator leaves a gauge out of /metrics when its source (Redis, Docker)
+      # fails, instead of reporting a false zero. This makes that visible.
+      - alert: OrchestratorMetricsCollectionFailing
+        expr: increase(metrics_collect_failures_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Orchestrator {{ $labels.replica }} cannot collect {{ $labels.collector }}"
+          description: "The data source behind {{ $labels.collector }} has failed repeatedly over the last 5 minutes; the other alerts depending on it are blind."
