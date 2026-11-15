@@ -116,7 +116,11 @@ promtool_run() {
   if command -v promtool > /dev/null 2>&1; then
     promtool "$@"
   else
-    docker run --rm -i -v "${REPO_ROOT}/infra/monitoring:/m:ro" -w /m --entrypoint promtool "$PROMTOOL_IMAGE" "$@"
+    docker run -q --rm -i \
+  -v "${REPO_ROOT}/infra/monitoring:/m:ro" \
+  -w /m \
+  --entrypoint promtool \
+  "$PROMTOOL_IMAGE" "$@"
   fi
 }
 
