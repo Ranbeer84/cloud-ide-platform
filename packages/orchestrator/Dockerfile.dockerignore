@@ -1,0 +1,12 @@
+# Used by BuildKit for packages/orchestrator/Dockerfile only (the repository root is the
+# build context). Keeps host-built node_modules and compiled output out of the image.
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.git
+.github
+.vscode
+phases
+infra
+scripts
+docs
