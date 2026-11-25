@@ -1,0 +1,63 @@
+# Shared Traefik objects for the Kubernetes deployment (Phase 10).
+#
+# The Docker setup discovered routes from `traefik.*` container labels. Kubernetes uses Traefik's
+# IngressRoute and Middleware custom resources (CRDs) instead, read by the kubernetescrd provider
+# configured in infra/k8s/proxy-deployment.yaml. Two kinds of route exist:
+#
+#   1. One IngressRoute PER SANDBOX, created and deleted by the orchestrator with the sandbox
+#      (packages/orchestrator/src/containers/k8sManager.ts, buildIngressRoutes). For session
+#      "s1" with SESSION_HOST_SUFFIX=.localhost it is exactly:
+#
+#        apiVersion: traefik.io/v1alpha1
+#        kind: IngressRoute
+#        metadata: { name: sbx-s1, namespace: live-sandboxes, ownerReferences: [the pod] }
+#        spec:
+#          entryPoints: [web]
+#          routes:
+#            - match: Host(`s1.localhost`)
+#              kind: Rule
+#              services: [{ name: sbx-s1, port: 8080 }]
+#
+#      With a real domain it becomes two: the one above gains the redirect Middleware below, and a
+#      second on entryPoint websecure carries `tls.certResolver` and the wildcard domain. Because the
+#      pod owns them, deleting the pod removes its routes. Nobody edits routes by hand.
+#
+#   2. The objects in this file, which are shared and applied once: the HTTP-to-HTTPS redirect the
+#      sandbox routes refer to, and the route to the orchestrator API.
+#
+# Requires the Traefik CRDs (see proxy-deployment.yaml) and namespaces live-sandboxes and live-system.
+#
+# Edit the Host() rule below to your API hostname (and SESSION_HOST_SUFFIX in the orchestrator's
+# ConfigMap to match your sandbox domain). `api.localhost` is the local-development default.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: sandbox-https-redirect
+  namespace: live-sandboxes
+  labels:
+    app.kubernetes.io/part-of: live
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+# The orchestrator API. /metrics is excluded: it is for Prometheus inside the cluster, not the internet.
+# Plain HTTP on entryPoint web. For HTTPS, add a second IngressRoute on entryPoint websecure with
+# `tls.certResolver: letsencrypt` for this host, and attach a redirectScheme Middleware to this one.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: orchestrator-api
+  namespace: live-system
+  labels:
+    app.kubernetes.io/name: live-orchestrator
+    app.kubernetes.io/part-of: live
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`api.localhost`) && !PathPrefix(`/metrics`)
+      kind: Rule
+      services:
+        - name: live-orchestrator
+          port: 4100
