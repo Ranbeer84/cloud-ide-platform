@@ -1,0 +1,343 @@
+# Orchestrator on Kubernetes (Phase 10): the control plane that creates sandbox pods.
+#
+# Apply order (every file is safe to apply again):
+#   1. infra/k8s/network-policy.yaml          sandbox namespace + isolation policies (Phase 7)
+#   2. the Traefik CRDs                       (see infra/k8s/proxy-deployment.yaml)
+#   3. infra/k8s/orchestrator-deployment.yaml this file: RuntimeClass, RBAC, Deployment, Service
+#   4. infra/k8s/redis.yaml, infra/k8s/postgres.yaml, infra/k8s/proxy-deployment.yaml
+#   5. packages/proxy/traefik/ingressroute-crd.yaml
+#
+# Secrets are NOT in this repository. Create them first, in namespace live-system:
+#
+#   live-redis            key: password       URL-safe characters only (it goes into REDIS_URL)
+#   live-postgres         key: password       URL-safe characters only (it goes into DATABASE_URL)
+#   live-orchestrator-auth
+#                         key: auth-secret    at least 32 characters (signs session tokens)
+#                         key: auth-users     JSON array of accounts, as in docker-compose.prod.yml
+#
+# Image: build packages/orchestrator/Dockerfile and make it available to the nodes as
+# live/orchestrator:latest (push it to your registry and change `image` below, or load it into
+# a local cluster). The sandbox image (SANDBOX_IMAGE below) must be available to every node that
+# can run sandboxes in the same way.
+#
+# gVisor: every node that can run sandboxes needs the runsc containerd shim and a containerd
+# runtime handler named "runsc". The RuntimeClass below tells Kubernetes which handler to use.
+# The orchestrator refuses to start unless that RuntimeClass exists and maps to gVisor.
+#
+# Host and TLS: SESSION_HOST_SUFFIX decides how sandboxes are routed. ".localhost" means plain
+# HTTP; a real domain (".sessions.example.dev") makes every sandbox route HTTPS with a wildcard
+# certificate (see proxy-deployment.yaml). WEB_BASE_URL and ALLOWED_ORIGIN must be the browser
+# origin of the web UI.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: live-system
+  labels:
+    app.kubernetes.io/part-of: live
+    pod-security.kubernetes.io/enforce: restricted
+---
+# Runs sandbox pods under gVisor. `overhead` makes the scheduler count the sandbox kernel's own
+# memory and CPU against the node on top of what the sandbox container requests.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+  labels:
+    app.kubernetes.io/part-of: live
+handler: runsc
+overhead:
+  podFixed:
+    memory: 64Mi
+    cpu: 100m
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: live-orchestrator
+  namespace: live-system
+  labels:
+    app.kubernetes.io/name: live-orchestrator
+    app.kubernetes.io/part-of: live
+---
+# What the orchestrator may do, and only in the sandbox namespace: manage the three kinds of
+# object that make up a sandbox. It cannot read secrets, exec into pods or touch any other namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: live-orchestrator-sandboxes
+  namespace: live-sandboxes
+  labels:
+    app.kubernetes.io/part-of: live
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: ["traefik.io"]
+    resources: ["ingressroutes"]
+    verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: live-orchestrator-sandboxes
+  namespace: live-sandboxes
+  labels:
+    app.kubernetes.io/part-of: live
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: live-orchestrator-sandboxes
+subjects:
+  - kind: ServiceAccount
+    name: live-orchestrator
+    namespace: live-system
+---
+# Cluster-scoped objects can only be read through a ClusterRole: the boot check that the
+# sandbox namespace and the gVisor RuntimeClass exist. Named resources only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: live-orchestrator-preflight
+  labels:
+    app.kubernetes.io/part-of: live
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["live-sandboxes"]
+    verbs: ["get"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    resourceNames: ["gvisor"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: live-orchestrator-preflight
+  labels:
+    app.kubernetes.io/part-of: live
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: live-orchestrator-preflight
+subjects:
+  - kind: ServiceAccount
+    name: live-orchestrator
+    namespace: live-system
+---
+# Everything that is not a secret. Same names and meanings as docker-compose.prod.yml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: live-orchestrator-config
+  namespace: live-system
+  labels:
+    app.kubernetes.io/name: live-orchestrator
+    app.kubernetes.io/part-of: live
+data:
+  ORCHESTRATOR_HOST: "0.0.0.0"
+  ORCHESTRATOR_PORT: "4100"
+  ORCHESTRATOR_AUTH_MODE: "required"
+  LOG_LEVEL: "info"
+  REDIS_KEY_PREFIX: "live:"
+  # Sandboxes are pods, not containers on this host.
+  SANDBOX_BACKEND: "kubernetes"
+  SANDBOX_IMAGE: "live/sandbox-base:latest"
+  SANDBOX_AGENT_PORT: "7777"
+  SANDBOX_MEMORY_MB: "512"
+  SANDBOX_CPUS: "1"
+  # Accepted for compatibility but not enforced per pod: Kubernetes limits processes per node
+  # with the kubelet's podPidsLimit setting.
+  SANDBOX_PIDS_LIMIT: "256"
+  # Starts counting once the pod is running (scheduling and image pull are waited for separately,
+  # up to K8S_POD_START_TIMEOUT_MS).
+  SANDBOX_READY_TIMEOUT_MS: "20000"
+  K8S_POD_START_TIMEOUT_MS: "120000"
+  K8S_SANDBOX_NAMESPACE: "live-sandboxes"
+  K8S_SANDBOX_RUNTIME_CLASS: "gvisor"
+  # strict: new sandboxes go to the least loaded node, and wait if that node is full.
+  # soft: prefer that, but run anywhere that fits. off: leave it to the scheduler.
+  K8S_TOPOLOGY_SPREAD: "strict"
+  K8S_TOPOLOGY_MAX_SKEW: "1"
+  # Must match `id sandbox` in the sandbox image.
+  K8S_SANDBOX_UID: "999"
+  K8S_SANDBOX_GID: "999"
+  K8S_SANDBOX_CPU_REQUEST_MILLIS: "250"
+  K8S_SANDBOX_EPHEMERAL_STORAGE_MB: "2048"
+  K8S_IMAGE_PULL_POLICY: "IfNotPresent"
+  MAX_SESSIONS: "50"
+  MAX_SESSIONS_PER_USER: "5"
+  SESSION_IDLE_TIMEOUT_MS: "1800000"
+  IDLE_REAPER_INTERVAL_MS: "30000"
+  RECONCILER_ORPHAN_POLICY: "kill"
+  # A replica starting must not mistake a sandbox another replica is still creating for an orphan.
+  RECONCILE_GRACE_MS: "60000"
+  # In-flight requests may finish for this long when a replica is stopped.
+  SHUTDOWN_GRACE_MS: "30000"
+  WEB_BASE_URL: "http://localhost:5173"
+  ALLOWED_ORIGIN: "http://localhost:5173"
+  SESSION_HOST_SUFFIX: ".localhost"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: live-orchestrator
+  namespace: live-system
+  labels:
+    app.kubernetes.io/name: live-orchestrator
+    app.kubernetes.io/part-of: live
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: live-orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: live-orchestrator
+        app.kubernetes.io/part-of: live
+    spec:
+      serviceAccountName: live-orchestrator
+      automountServiceAccountToken: true
+      # SHUTDOWN_GRACE_MS (30 s) plus the preStop pause, with margin.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Replicas on different nodes, so one node failing leaves the API up.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: live-orchestrator
+      containers:
+        - name: orchestrator
+          image: live/orchestrator:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 4100
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: live-orchestrator-config
+          # Order matters: a value can only refer to variables defined above it.
+          env:
+            - name: REPLICA_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: live-redis
+                  key: password
+            - name: REDIS_URL
+              value: "redis://:$(REDIS_PASSWORD)@live-redis:6379"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: live-postgres
+                  key: password
+            - name: DATABASE_URL
+              value: "postgres://live:$(POSTGRES_PASSWORD)@live-postgres:5432/live"
+            - name: ORCHESTRATOR_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: live-orchestrator-auth
+                  key: auth-secret
+            - name: ORCHESTRATOR_AUTH_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: live-orchestrator-auth
+                  key: auth-users
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Boot runs the reconciler and may wait on Redis and Postgres: allow up to 60 s.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          # Ready only while Redis answers (/healthz is 503 otherwise): no traffic to a replica that cannot work.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          # Liveness must not depend on Redis, or a Redis outage would restart every replica.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Lets the Service stop sending new requests before the process begins shutting down.
+                command: ["sleep", "5"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: live-orchestrator
+  namespace: live-system
+  labels:
+    app.kubernetes.io/name: live-orchestrator
+    app.kubernetes.io/part-of: live
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: live-orchestrator
+  ports:
+    - name: http
+      port: 4100
+      targetPort: http
+      protocol: TCP
+---
+# A rolling update or a node drain never takes both replicas down at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: live-orchestrator
+  namespace: live-system
+  labels:
+    app.kubernetes.io/name: live-orchestrator
+    app.kubernetes.io/part-of: live
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: live-orchestrator
