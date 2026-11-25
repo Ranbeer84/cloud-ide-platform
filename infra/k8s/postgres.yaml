@@ -1,0 +1,171 @@
+# Postgres on Kubernetes (Phase 10): durable accounts, session history and audit log.
+#
+# A StatefulSet rather than a Deployment, for the same reason as Redis: it owns data, so it gets
+# its own persistent volume and a stable identity. One replica. This is a single instance, not a
+# highly available cluster: take backups (pg_dump on a schedule, to storage outside the cluster)
+# before relying on it. Replication and failover need an operator such as CloudNativePG.
+#
+# Create the password first, in namespace live-system (URL-safe characters only, because the
+# orchestrator puts it into DATABASE_URL):
+#   Secret live-postgres, key: password
+#
+# Only the orchestrator and streaming pods may connect (NetworkPolicy below).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: live-system
+  labels:
+    app.kubernetes.io/part-of: live
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: live-postgres
+  namespace: live-system
+  labels:
+    app.kubernetes.io/name: live-postgres
+    app.kubernetes.io/part-of: live
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: live-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: live-postgres
+  namespace: live-system
+  labels:
+    app.kubernetes.io/name: live-postgres
+    app.kubernetes.io/part-of: live
+spec:
+  serviceName: live-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: live-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: live-postgres
+        app.kubernetes.io/part-of: live
+    spec:
+      automountServiceAccountToken: false
+      # Time to finish a clean shutdown (checkpoint) before the kubelet kills the process.
+      terminationGracePeriodSeconds: 60
+      # postgres:16-alpine runs as uid 70 (user "postgres"); fsGroup makes the volume writable for it.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: live
+            - name: POSTGRES_DB
+              value: live
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: live-postgres
+                  key: password
+            # A subdirectory: the volume's root can contain a lost+found directory, which initdb refuses.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "live", "-d", "live"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # First start runs initdb, which can take a while on slow storage.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "live", "-d", "live"]
+            periodSeconds: 3
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "live", "-d", "live"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            # Unix socket and temporary files: the root filesystem is read-only.
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: live-postgres
+          app.kubernetes.io/part-of: live
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: live-postgres-allow-control-plane
+  namespace: live-system
+  labels:
+    app.kubernetes.io/part-of: live
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: live-postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: live-orchestrator
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: live-streaming
+      ports:
+        - protocol: TCP
+          port: 5432
