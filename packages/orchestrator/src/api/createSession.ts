@@ -3,6 +3,7 @@ import type { ManagedContainer } from "../containers/containerTypes.js";
 import { describeError, isTransientSpawnError } from "../containers/errorDetails.js";
 import type { SessionRecord } from "../sessionStore/sessionStore.js";
 import {
+  agentHostFor,
   ApiError,
   toSessionView,
   type ApiContext,
@@ -34,9 +35,10 @@ async function generateUniqueSessionId(ctx: ApiContext): Promise<string> {
 /** Polls the sandbox-agent's /health until it answers 200 or the deadline passes. */
 async function waitForAgentReady(
   ctx: ApiContext,
+  sessionId: string,
   hostAgentPort: number,
 ): Promise<boolean> {
-  const url = `http://${ctx.config.sandboxAgentHost}:${hostAgentPort}/health`;
+  const url = `http://${agentHostFor(ctx.config, sessionId)}:${hostAgentPort}/health`;
   const deadline = ctx.now() + ctx.config.sandboxReadyTimeoutMs;
 
   while (ctx.now() < deadline) {
@@ -154,7 +156,7 @@ export async function createSession(ctx: ApiContext, ownerId: string): Promise<C
     }
   }
 
-  const ready = await waitForAgentReady(ctx, container.hostAgentPort);
+  const ready = await waitForAgentReady(ctx, sessionId, container.hostAgentPort);
   if (!ready) {
     ctx.logger.error("session.agent_not_ready", { sessionId, containerId: container.containerId });
     await ctx.docker.stopContainer(container.containerId).catch(() => undefined);

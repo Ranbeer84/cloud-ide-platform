@@ -4,14 +4,23 @@ import { fileURLToPath } from "node:url";
 import { createRequestHandler } from "./api/routes.js";
 import { Authenticator } from "./auth/authMiddleware.js";
 import { loadConfig, type OrchestratorConfig } from "./config.js";
+// import { GvisorManager } from "./containers/gvisorManager.js";
 import { GvisorManager } from "./containers/gvisorManager.js";
+import {
+  createK8sApi,
+  K8sManager,
+  loadK8sManagerOptions,
+  loadKubeConfig,
+  sandboxAgentHostTemplate,
+  type K8sManagerOptions,
+} from "./containers/k8sManager.js";
 import { HistoryRecordingSessionStore, loadPostgresOptions, PostgresDatabase } from "./db/postgres.js";
 import { IdleReaper } from "./idleReaper.js";
 import { createLoggerFromEnv } from "./logging.js";
 import { createOrchestratorMetrics, type ObservableApiContext, type OrchestratorMetrics } from "./metrics.js";
 import { reconcile, type ReconcileReport } from "./reconciler.js";
 import { createRedisClient, RedisSessionStore } from "./sessionStore/redisStore.js";
-import type { Logger, OrchestratorSessionStore } from "./sessionStore/sessionTypes.js";
+import type { Logger, OrchestratorSessionStore, SessionDocker } from "./sessionStore/sessionTypes.js";
 
 // ---- Public library surface (imported by phase verification scripts) ----
 export { DockerManager } from "./containers/dockerManager.js";
@@ -24,6 +33,27 @@ export {
   sessionBridgeName,
 } from "./containers/gvisorManager.js";
 export type { GvisorManagerOptions } from "./containers/gvisorManager.js";
+export {
+  K8sManager,
+  SANDBOX_OBJECT_PREFIX,
+  buildIngressRoutes,
+  buildSandboxPod,
+  buildSandboxService,
+  createK8sApi,
+  loadK8sManagerOptions,
+  loadKubeConfig,
+  podStatus,
+  sandboxAgentHostTemplate,
+  sandboxObjectName,
+  sandboxServiceHost,
+} from "./containers/k8sManager.js";
+export type {
+  IngressRouteObject,
+  K8sApi,
+  K8sManagerOptions,
+  OwnerReference,
+  TopologySpreadMode,
+} from "./containers/k8sManager.js";
 export {
   Authenticator,
   TokenService,
@@ -89,6 +119,67 @@ export type { ObservableApiContext, OrchestratorMetrics, OrchestratorMetricsDeps
  */
 export function createJsonLogger(env: Readonly<Record<string, string | undefined>> = process.env): Logger {
   return createLoggerFromEnv(env);
+}
+
+export type SandboxBackendName = "docker" | "kubernetes";
+
+/**
+ * Where sandboxes run. Everything the API, the reaper and the reconciler need is the
+ * SessionDocker surface; the two things only boot needs are checking the runtime and
+ * clearing leftovers, which differ per backend.
+ */
+interface SandboxBackend {
+  readonly name: SandboxBackendName;
+  readonly docker: SessionDocker;
+  /** Throws unless sandboxes can be run safely (gVisor present). */
+  assertRuntime(): Promise<void>;
+  /** Removes per-session leftovers (Docker networks, or Services and IngressRoutes) of sessions not in the set. */
+  pruneOrphans(activeSessionIds: ReadonlySet<string>, graceMs: number): Promise<void>;
+}
+
+/** SANDBOX_BACKEND: "docker" (default, one Docker host) or "kubernetes" (sandbox pods; Phase 10). */
+function readSandboxBackend(env: Readonly<Record<string, string | undefined>>): SandboxBackendName {
+  const raw = env["SANDBOX_BACKEND"]?.trim().toLowerCase() || "docker";
+  if (raw !== "docker" && raw !== "kubernetes") {
+    throw new Error(`SANDBOX_BACKEND must be "docker" or "kubernetes" (got "${raw}")`);
+  }
+  return raw;
+}
+
+function createDockerBackend(traefikContainer: string, logger: Logger): SandboxBackend {
+  const manager = new GvisorManager({ traefikContainer, logger });
+  return {
+    name: "docker",
+    docker: manager,
+    assertRuntime: () => manager.assertRunscAvailable(),
+    async pruneOrphans(activeSessionIds, graceMs) {
+      // Same grace as containers: a network younger than this may belong to a
+      // POST /api/sessions on another replica that has not written its record yet.
+      const removed = await manager.pruneOrphanNetworks(activeSessionIds, { graceMs });
+      if (removed.length > 0) {
+        logger.warn("network.pruned_orphans", { networks: removed });
+      }
+    },
+  };
+}
+
+function createKubernetesBackend(options: K8sManagerOptions, env: Readonly<Record<string, string | undefined>>, logger: Logger): SandboxBackend {
+  const manager = new K8sManager({
+    options,
+    api: createK8sApi(loadKubeConfig(env), { group: options.ingressRouteGroup, version: options.ingressRouteVersion }),
+    logger,
+  });
+  return {
+    name: "kubernetes",
+    docker: manager,
+    assertRuntime: () => manager.assertRuntimeAvailable(),
+    async pruneOrphans(activeSessionIds, graceMs) {
+      const removed = await manager.pruneOrphanRoutes(activeSessionIds, { graceMs });
+      if (removed.length > 0) {
+        logger.warn("k8s.pruned_orphans", { objects: removed });
+      }
+    },
+  };
 }
 
 export interface RunningOrchestrator {
@@ -172,13 +263,25 @@ export async function startOrchestrator(
   env: Readonly<Record<string, string | undefined>> = process.env,
   logger: Logger = createLoggerFromEnv(env, { replicaId: env["REPLICA_ID"]?.trim() || "orchestrator" }),
 ): Promise<RunningOrchestrator> {
-  const config = loadConfig(env);
+  const backendName = readSandboxBackend(env);
+  const k8sOptions = backendName === "kubernetes" ? loadK8sManagerOptions(env) : undefined;
+  // Each Kubernetes sandbox has its own Service, so unless the operator says otherwise the
+  // agent host is a per-session name; "{subdomain}" is filled in per session (agentHostFor).
+  const effectiveEnv =
+    k8sOptions !== undefined && !env["SANDBOX_AGENT_HOST"]?.trim()
+      ? { ...env, SANDBOX_AGENT_HOST: sandboxAgentHostTemplate(k8sOptions.namespace) }
+      : env;
+  const config = loadConfig(effectiveEnv);
   const shutdownGraceMs = readShutdownGraceMs(env);
   const metricsToken = readMetricsToken(env);
   const now = (): number => Date.now();
 
-  const docker = new GvisorManager({ traefikContainer: config.traefikContainer, logger });
-  await docker.assertRunscAvailable();
+    const backend =
+    k8sOptions !== undefined
+      ? createKubernetesBackend(k8sOptions, env, logger)
+      : createDockerBackend(config.traefikContainer, logger);
+  const docker = backend.docker;
+  await backend.assertRuntime();
 
   const auth = new Authenticator({
     settings:
@@ -246,12 +349,7 @@ export async function startOrchestrator(
     for (const sessionId of youngUnrecorded) {
       activeSessionIds.add(sessionId);
     }
-    // Same grace as containers: a network younger than this may belong to a
-    // POST /api/sessions on another replica that has not written its record yet.
-    const removedNetworks = await docker.pruneOrphanNetworks(activeSessionIds, { graceMs });
-    if (removedNetworks.length > 0) {
-      logger.warn("network.pruned_orphans", { networks: removedNetworks });
-    }
+    await backend.pruneOrphans(activeSessionIds, graceMs);
   } catch (error) {
     redis.disconnect();
     await database?.close().catch(() => undefined);
@@ -296,7 +394,9 @@ export async function startOrchestrator(
     hostSuffix: config.hostSuffix,
     orphanPolicy: config.orphanPolicy,
     authMode: config.authMode,
-    runtime: "runsc",
+    // runtime: "runsc",
+    sandboxBackend: backend.name,
+    runtime: k8sOptions !== undefined ? k8sOptions.runtimeClassName || "default" : "runsc",
     replicaId,
     database: database !== undefined,
     metricsAuth: metricsToken !== undefined,

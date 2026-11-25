@@ -191,6 +191,16 @@ export interface ApiContext {
   readonly now: () => number;
 }
 
+/**
+ * The host name a session's sandbox-agent is reached at. SANDBOX_AGENT_HOST is normally one
+ * fixed host (the Docker host's loopback, where every sandbox's agent port is published).
+ * With Kubernetes every sandbox has its own Service, so the literal "{subdomain}" in the
+ * value is replaced by the session's sanitized id, for example `sbx-{subdomain}.live-sandboxes.svc`.
+ */
+export function agentHostFor(config: Pick<OrchestratorConfig, "sandboxAgentHost">, sessionId: string): string {
+  return config.sandboxAgentHost.replace("{subdomain}", sanitizeSubdomain(sessionId));
+}
+
 /** What the API returns for a session (create, get and list). */
 export interface SessionView {
   readonly sessionId: string;
@@ -233,7 +243,8 @@ export function toSessionView(record: SessionRecord, config: OrchestratorConfig)
     hostUrl: `${config.webBaseUrl}/host?session=${encodedId}`,
     viewerUrl: `${config.webBaseUrl}/viewer?session=${encodedId}`,
     previewUrl: `${config.previewScheme}://${sanitizeSubdomain(record.sessionId)}${config.hostSuffix}`,
-    agentUrl: `http://${config.sandboxAgentHost}:${record.hostAgentPort}`,
+    // agentUrl: `http://${config.sandboxAgentHost}:${record.hostAgentPort}`, 
+    agentUrl: `http://${agentHostFor(config, record.sessionId)}:${record.hostAgentPort}`,
     containerId: record.containerId,
     status: record.status,
     createdAt: record.createdAt,
