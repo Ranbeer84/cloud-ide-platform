@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@kubernetes/client-node": "^2.0.2",
+    "@kubernetes/client-node": "~1.4.0",
     "@live/shared-types": "workspace:*",
     "dockerode": "^4.0.2",
     "ioredis": "^5.4.1",
