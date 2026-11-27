@@ -565,6 +565,27 @@ else { console.error("unknown command " + command); process.exit(1); }
   [ "$NODE_COUNT" -ge 2 ] || fail "the cluster has $NODE_COUNT Ready schedulable node(s) (${SCHEDULABLE}); Phase 10 needs at least 2"
   pass "context ${CONTEXT} has ${NODE_COUNT} Ready schedulable nodes: ${SCHEDULABLE}"
 
+  # kind load docker-image can fail with "ctr: content digest sha256:... not found" when Docker uses
+  # the containerd image store: a pulled multi-platform image is an index whose other platforms were
+  # never downloaded, and `ctr import --all-platforms` insists on them. Fall back to exporting only
+  # the host platform and loading that archive.
+  load_into_kind() { # load_into_kind IMAGE KIND_CLUSTER_NAME
+    local image="$1" name="$2" archive="$LOG_DIR/image-load.tar" platform
+    if kind load docker-image "$image" --name "$name" > "$LOG_DIR/kind-load.log" 2>&1; then
+      return 0
+    fi
+    platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2> /dev/null || true)"
+    note "kind load docker-image ${image} failed; retrying with an archive of ${platform:-the host platform} only"
+    if { docker save --platform "$platform" -o "$archive" "$image" || docker save -o "$archive" "$image"; } > "$LOG_DIR/kind-load-fallback.log" 2>&1 \
+      && kind load image-archive "$archive" --name "$name" >> "$LOG_DIR/kind-load-fallback.log" 2>&1; then
+      rm -f "$archive"
+      return 0
+    fi
+    rm -f "$archive"
+    cat "$LOG_DIR/kind-load.log" "$LOG_DIR/kind-load-fallback.log"
+    return 1
+  }
+
   # ---- 5.1 images ----
   if [ "$SKIP_IMAGE_BUILD" != "1" ]; then
     docker build -f packages/orchestrator/Dockerfile -t "$ORCH_IMAGE" . > "$LOG_DIR/orch-build.log" 2>&1 \
@@ -575,8 +596,7 @@ else { console.error("unknown command " + command); process.exit(1); }
     KIND_TARGET="${CONTEXT#kind-}"
     for image in "$ORCH_IMAGE" "$SANDBOX_IMAGE" redis:7-alpine postgres:16-alpine traefik:v3.1; do
       if docker image inspect "$image" > /dev/null 2>&1; then
-        kind load docker-image "$image" --name "$KIND_TARGET" > "$LOG_DIR/kind-load.log" 2>&1 \
-          || { cat "$LOG_DIR/kind-load.log"; fail "kind load docker-image $image"; }
+        load_into_kind "$image" "$KIND_TARGET" || fail "kind load docker-image $image"
       else
         note "image $image is not on this host, so the nodes will pull it"
       fi
