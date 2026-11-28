@@ -110,7 +110,9 @@ njs() {
   node -e '
     const d = JSON.parse(require("fs").readFileSync(0, "utf8"));
     const result = (function (d) { return eval(process.argv[1]); })(d);
-    if (result !== undefined) { console.log(typeof result === "object" ? JSON.stringify(result) : result); }
+    // An empty string means "nothing to report": print nothing at all, not a bare newline (which would make
+    // the output file non-empty and a `[ -s file ]` test report a problem that is not there).
+    if (result !== undefined && result !== "") { console.log(typeof result === "object" ? JSON.stringify(result) : result); }
   ' "$1"
 }
 
@@ -777,7 +779,9 @@ else { console.error("unknown command " + command); process.exit(1); }
   fi
 
   k apply -f infra/k8s/network-policy.yaml > /dev/null || fail "applying network-policy.yaml"
-  k get namespace "$SYSTEM_NS" > /dev/null 2>&1 || k create namespace "$SYSTEM_NS" > /dev/null
+  # --save-config records the object the way `kubectl apply` does, so the manifests below (which also declare
+  # this namespace, with its Pod Security labels) can be applied over it without a "missing annotation" warning.
+  k get namespace "$SYSTEM_NS" > /dev/null 2>&1 || k create namespace "$SYSTEM_NS" --save-config > /dev/null
   ensure_secret() { # ensure_secret NAME KEY VALUE : create once, never rotate (Postgres reads its password only on first start)
     if ! k -n "$SYSTEM_NS" get secret "$1" > /dev/null 2>&1; then
       k -n "$SYSTEM_NS" create secret generic "$1" --from-literal="$2=$3" > /dev/null || fail "creating secret $1"
@@ -883,7 +887,7 @@ else { console.error("unknown command " + command); process.exit(1); }
     if (!(d.spec.topologySpreadConstraints || []).length) problems.push("no topology spread constraint");
     if (Object.keys(d.metadata.labels).some((l) => l.startsWith("traefik."))) problems.push("pod carries traefik labels");
     problems.join("; ")' > "$LOG_DIR/podcheck.out" 2> "$LOG_DIR/podcheck.err" || { cat "$LOG_DIR/podcheck.err"; fail "could not inspect pod $P1"; }
-  [ ! -s "$LOG_DIR/podcheck.out" ] && pass "pod ${P1}: no API token, non-root, no capabilities, memory limit, topology spread, no traefik labels" \
+  [ -z "$(cat "$LOG_DIR/podcheck.out")" ] && pass "pod ${P1}: no API token, non-root, no capabilities, memory limit, topology spread, no traefik labels" \
     || fail "pod $P1 is not hardened: $(cat "$LOG_DIR/podcheck.out")"
   if [ "$ALLOW_NO_GVISOR" != "1" ]; then
     [ "$(k -n "$SANDBOX_NS" get pod "$P1" -o json | njs 'd.spec.runtimeClassName')" = "gvisor" ] \
@@ -905,7 +909,7 @@ else { console.error("unknown command " + command); process.exit(1); }
     if ((d.spec.template.spec.volumes || []).some((v) => v.hostPath)) problems.push("hostPath volume");
     if (!text.includes("providers.kubernetescrd=true")) problems.push("CRD provider not enabled");
     problems.join("; ")' > "$LOG_DIR/proxycheck.out" || fail "could not inspect the proxy deployment"
-  [ ! -s "$LOG_DIR/proxycheck.out" ] && pass "the running proxy uses the Kubernetes CRD provider: no Docker provider, no Docker socket, no hostPath" \
+  [ -z "$(cat "$LOG_DIR/proxycheck.out")" ] && pass "the running proxy uses the Kubernetes CRD provider: no Docker provider, no Docker socket, no hostPath" \
     || fail "the running proxy is misconfigured: $(cat "$LOG_DIR/proxycheck.out")"
 
   # A web server started in the sandbox is reachable through Traefik, and the route goes away with the pod.
