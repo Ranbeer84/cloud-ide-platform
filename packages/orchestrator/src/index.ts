@@ -276,7 +276,7 @@ export async function startOrchestrator(
   const metricsToken = readMetricsToken(env);
   const now = (): number => Date.now();
 
-    const backend =
+  const backend =
     k8sOptions !== undefined
       ? createKubernetesBackend(k8sOptions, env, logger)
       : createDockerBackend(config.traefikContainer, logger);

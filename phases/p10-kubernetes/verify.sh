@@ -83,9 +83,14 @@ pass() { echo "  PASS: $1"; }
 note() { echo "  NOTE: $1"; }
 
 k() { kubectl --request-timeout=60s "$@"; }
+# `kubectl wait` and `kubectl rollout status` hold a watch open for up to their own --timeout. A client-side
+# --request-timeout would cut that watch short (after 60 s), so long waits go through this instead.
+kw() { kubectl "$@"; }
 
 diagnostics() {
   echo "  --- cluster diagnostics ---"
+  k get nodes -o wide 2> /dev/null || true
+  k -n kube-system get pods -o wide 2> /dev/null || true
   k -n "$SYSTEM_NS" get pods -o wide 2> /dev/null || true
   k -n "$SANDBOX_NS" get pods -o wide 2> /dev/null || true
   k -n "$SYSTEM_NS" logs -l app.kubernetes.io/name=live-orchestrator --tail=25 --prefix 2> /dev/null || true
@@ -146,6 +151,19 @@ if [ "$SKIP_REGRESSION" != "1" ]; then
   command -v docker > /dev/null 2>&1 || fail "docker is required for the regression suite (or set P10_SKIP_REGRESSION=1)"
 fi
 pass "required tools are present"
+if [ "$SKIP_CLUSTER" != "1" ]; then
+  # A 3-node kind cluster with Calico, Redis, Postgres, Traefik, 2 orchestrators and several sandboxes
+  # shares ONE machine. When it is too small the API server's health checks start failing mid-run.
+  HOST_CPUS="$(nproc 2> /dev/null || echo 0)"
+  HOST_MEM_MB="$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2> /dev/null || echo 0)"
+  HOST_MEM_MB="${HOST_MEM_MB:-0}"
+  SMALL_HOST=0
+  if [ "$HOST_CPUS" -gt 0 ] && [ "$HOST_CPUS" -lt 4 ]; then SMALL_HOST=1; fi
+  if [ "$HOST_MEM_MB" -gt 0 ] && [ "$HOST_MEM_MB" -lt 7500 ]; then SMALL_HOST=1; fi
+  if [ "$SMALL_HOST" = "1" ]; then
+    note "this machine has ${HOST_CPUS} CPU(s) and ${HOST_MEM_MB} MB of memory; the cluster steps want at least 4 CPUs and 8 GB, and may fail with API-server timeouts below that"
+  fi
+fi
 echo
 
 # --------------------------------------------------------------------------
@@ -476,6 +494,7 @@ else { console.error("unknown command " + command); process.exit(1); }
         fi
       fi
     fi
+    rm -f "$LOG_DIR/kubeconfig" # last, because the commands above use it; it holds the cluster admin's client certificate
   }
   trap cleanup EXIT
 
@@ -527,8 +546,15 @@ else { console.error("unknown command " + command); process.exit(1); }
     patch="$(node -e 'const o = {}; for (const a of process.argv.slice(1)) { const i = a.indexOf("="); o[a.slice(0, i)] = a.slice(i + 1); } console.log(JSON.stringify({ data: o }));' "$@")"
     k -n "$SYSTEM_NS" patch configmap live-orchestrator-config --type merge -p "$patch" > /dev/null
     k -n "$SYSTEM_NS" rollout restart deploy/live-orchestrator > /dev/null
-    k -n "$SYSTEM_NS" rollout status deploy/live-orchestrator --timeout=300s > /dev/null || fail "the orchestrator did not come back after a configuration change"
+    kw -n "$SYSTEM_NS" rollout status deploy/live-orchestrator --timeout=300s > /dev/null || fail "the orchestrator did not come back after a configuration change"
     start_forwards
+  }
+
+  api_ready() { k get --raw=/readyz > /dev/null 2>&1; }
+  wait_for_api() { # wait_for_api SECONDS WHEN : the control plane must be healthy before anything is applied to it
+    wait_until "$1" api_ready && return 0
+    echo "  API server /readyz: $(k get --raw='/readyz?verbose' 2>&1 | grep -v '^\[+\]' | head -n 8 | tr '\n' ' ')"
+    fail "the Kubernetes API server is not ready ($2). The machine is probably short of CPU, memory or disk I/O: give it 4+ CPUs and 8+ GB, or run 'kind delete cluster --name ${KIND_NAME}' and start again"
   }
 
   # ---- 5.0 pick (or create) the cluster, and isolate this run's kubeconfig ----
@@ -553,40 +579,127 @@ else { console.error("unknown command " + command); process.exit(1); }
   export KUBECONFIG="$LOG_DIR/kubeconfig"
   CLUSTER_STARTED=1
   k version > /dev/null 2>&1 || fail "cannot reach the cluster of context $CONTEXT"
-  if [ "$CREATE_KIND" = "1" ] && [ "$KIND_CNI" = "calico" ] && [ "$KIND_CREATED_BY_GATE" = "1" ]; then
+  wait_for_api 120 "right after connecting"
+  # A kind cluster created without a CNI (calico mode) stays NotReady until Calico is installed. Install it
+  # whenever it is missing, not only on the run that created the cluster: an earlier run may have stopped
+  # before Calico was applied.
+  if [ "$CREATE_KIND" = "1" ] && [ "$KIND_CNI" = "calico" ] \
+    && ! k -n kube-system get ds calico-node > /dev/null 2>&1 && ! k -n kube-system get ds kindnet > /dev/null 2>&1; then
     k apply -f "$CALICO_URL" > "$LOG_DIR/calico.log" 2>&1 || { cat "$LOG_DIR/calico.log"; fail "installing Calico"; }
-    k -n kube-system rollout status ds/calico-node --timeout=300s > /dev/null || fail "Calico did not become ready"
+    # kind nodes are containers on a host whose reverse-path filtering may be "loose"; without this Calico's
+    # felix refuses to start there (the documented kind setup).
+    k -n kube-system set env ds/calico-node FELIX_IGNORELOOSERPF=true > /dev/null || fail "configuring Calico for kind"
+    kw -n kube-system rollout status ds/calico-node --timeout=420s > /dev/null || fail "Calico did not become ready"
+    kw -n kube-system rollout status deploy/calico-kube-controllers --timeout=300s > /dev/null || fail "calico-kube-controllers did not become ready"
     pass "installed Calico, so NetworkPolicy is enforced"
   fi
-  k wait --for=condition=Ready node --all --timeout=300s > /dev/null || fail "not every node became Ready"
+  kw wait --for=condition=Ready node --all --timeout=300s > /dev/null || fail "not every node became Ready"
+  # Cluster DNS carries every Service lookup below (Redis, Postgres, the sandbox Services).
+  kw -n kube-system rollout status deploy/coredns --timeout=300s > /dev/null || fail "CoreDNS did not become ready"
+  wait_for_api 120 "after the nodes became Ready"
 
   SCHEDULABLE="$(k get nodes -o json | njs 'd.items.filter((n) => n.status.conditions.some((c) => c.type === "Ready" && c.status === "True") && !n.spec.unschedulable && !(n.spec.taints || []).some((t) => t.effect === "NoSchedule" || t.effect === "NoExecute")).map((n) => n.metadata.name).join(" ")')"
   NODE_COUNT="$(echo "$SCHEDULABLE" | wc -w | tr -d ' ')"
   [ "$NODE_COUNT" -ge 2 ] || fail "the cluster has $NODE_COUNT Ready schedulable node(s) (${SCHEDULABLE}); Phase 10 needs at least 2"
   pass "context ${CONTEXT} has ${NODE_COUNT} Ready schedulable nodes: ${SCHEDULABLE}"
 
-  # kind load docker-image can fail with "ctr: content digest sha256:... not found" when Docker uses
-  # the containerd image store: a pulled multi-platform image is an index whose other platforms were
-  # never downloaded, and `ctr import --all-platforms` insists on them. Fall back to exporting only
-  # the host platform and loading that archive.
-  load_into_kind() { # load_into_kind IMAGE KIND_CLUSTER_NAME
-    local image="$1" name="$2" archive="$LOG_DIR/image-load.tar" platform
-    if kind load docker-image "$image" --name "$name" > "$LOG_DIR/kind-load.log" 2>&1; then
+  # ---- 5.1 images ----
+  #
+  # `kind load docker-image` can fail on a host whose Docker uses the containerd image store (the default
+  # on new installs). Pulled images are then multi-platform indexes that also carry attestation manifests,
+  # and kind imports them with `ctr import --all-platforms --digests`, which fails in one of two ways:
+  #     ctr: content digest sha256:...: not found                   (a platform that was never downloaded)
+  #     ctr: mismatched image rootfs and manifest layers            (an attestation manifest is not an image)
+  # Both flags are only needed for images that must run on every platform. The nodes here run the host's
+  # platform, so the fallbacks below import without them.
+  #
+  # Images go to the schedulable (worker) nodes only. The control-plane node cannot run workloads, and
+  # unpacking several hundred MB into its containerd competes with etcd and the API server for disk and
+  # CPU, which on a small machine is enough to make the API server's health checks fail.
+  kind_nodes() { echo "$SCHEDULABLE"; } # kind names a node after its container, so these are docker container names
+
+  image_on_node() { docker exec "$1" crictl inspecti "$2" > /dev/null 2>&1; } # image_on_node NODE IMAGE
+
+  # Imports an image archive into one node's containerd the way kind does, minus --all-platforms/--digests.
+  import_into_node() { # import_into_node NODE ARCHIVE
+    docker exec --privileged -i "$1" ctr --namespace=k8s.io images import --snapshotter=overlayfs - < "$2" \
+      >> "$LOG_DIR/kind-load-fallback.log" 2>&1
+  }
+
+  load_into_kind() { # load_into_kind IMAGE KIND_CLUSTER_NAME [public]
+    local image="$1" name="$2" kind_of_image="${3:-local}" archive="$LOG_DIR/image-load.tar" platform node nodes missing=0
+    nodes="$(kind_nodes)"
+    : > "$LOG_DIR/kind-load.log"
+    : > "$LOG_DIR/kind-load-fallback.log"
+
+    # Registry images are identified by their tag, so a node that already has one needs nothing.
+    # (A locally built image can change under the same tag, so it is always loaded again.)
+    if [ "$kind_of_image" = "public" ]; then
+      for node in $nodes; do image_on_node "$node" "$image" || missing=1; done
+      if [ "$missing" = "0" ]; then
+        return 0
+      fi
+    fi
+
+    # 1. kind's own loader, the fast path where it works.
+    if kind load docker-image "$image" --name "$name" --nodes "${nodes// /,}" > "$LOG_DIR/kind-load.log" 2>&1; then
       return 0
     fi
+
+    # 2. Export only the host platform and import it ourselves.
     platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2> /dev/null || true)"
-    note "kind load docker-image ${image} failed; retrying with an archive of ${platform:-the host platform} only"
-    if { docker save --platform "$platform" -o "$archive" "$image" || docker save -o "$archive" "$image"; } > "$LOG_DIR/kind-load-fallback.log" 2>&1 \
-      && kind load image-archive "$archive" --name "$name" >> "$LOG_DIR/kind-load-fallback.log" 2>&1; then
+    note "kind load docker-image ${image} failed; importing an archive of ${platform:-the host platform} only"
+    if { docker save --platform "$platform" -o "$archive" "$image" || docker save -o "$archive" "$image"; } >> "$LOG_DIR/kind-load-fallback.log" 2>&1; then
+      missing=0
+      for node in $nodes; do
+        import_into_node "$node" "$archive" || missing=1
+      done
       rm -f "$archive"
-      return 0
+      if [ "$missing" = "0" ]; then
+        return 0
+      fi
     fi
     rm -f "$archive"
+
+    # 3. A registry image can also be pulled by the nodes themselves.
+    if [ "$kind_of_image" = "public" ]; then
+      note "importing ${image} failed; the nodes will pull it from the registry"
+      missing=0
+      for node in $nodes; do
+        for _ in 1 2 3; do
+          if docker exec "$node" crictl pull "$image" >> "$LOG_DIR/kind-load-fallback.log" 2>&1; then
+            continue 2
+          fi
+          sleep 3
+        done
+        missing=1
+      done
+      if [ "$missing" = "0" ]; then
+        return 0
+      fi
+    fi
+
     cat "$LOG_DIR/kind-load.log" "$LOG_DIR/kind-load-fallback.log"
     return 1
   }
 
-  # ---- 5.1 images ----
+  # The sandbox image is built locally and is in no registry: a kind cluster cannot get it any other way.
+  if [[ "$CONTEXT" == kind-* ]] && ! docker image inspect "$SANDBOX_IMAGE" > /dev/null 2>&1; then
+    fail "the sandbox image ${SANDBOX_IMAGE} is not on this host, and no cluster can pull it. Build it first: bash scripts/seed-sandbox-image.sh"
+  fi
+  # The pods run as a fixed numeric user (K8S_SANDBOX_UID/GID): it must be the image's `sandbox` user, or the
+  # agent cannot write to /workspace. Check it where the image is available.
+  if docker image inspect "$SANDBOX_IMAGE" > /dev/null 2>&1; then
+    MANIFEST_UID="$(sed -n 's/^ *K8S_SANDBOX_UID: "\([0-9]*\)".*/\1/p' infra/k8s/orchestrator-deployment.yaml | head -n 1)"
+    MANIFEST_GID="$(sed -n 's/^ *K8S_SANDBOX_GID: "\([0-9]*\)".*/\1/p' infra/k8s/orchestrator-deployment.yaml | head -n 1)"
+    IMAGE_UID="$(docker run --rm --entrypoint id "$SANDBOX_IMAGE" -u sandbox 2> /dev/null || true)"
+    IMAGE_GID="$(docker run --rm --entrypoint id "$SANDBOX_IMAGE" -g sandbox 2> /dev/null || true)"
+    if [ -n "$IMAGE_UID" ] && [ -n "$IMAGE_GID" ] && { [ "$IMAGE_UID" != "${MANIFEST_UID:-999}" ] || [ "$IMAGE_GID" != "${MANIFEST_GID:-999}" ]; }; then
+      fail "the sandbox image's user is ${IMAGE_UID}:${IMAGE_GID}, but the pods run as ${MANIFEST_UID:-999}:${MANIFEST_GID:-999}. Set K8S_SANDBOX_UID/K8S_SANDBOX_GID in infra/k8s/orchestrator-deployment.yaml to match"
+    fi
+    pass "the sandbox image's user (${IMAGE_UID:-unknown}:${IMAGE_GID:-unknown}) matches the pods' numeric user"
+  fi
+
   if [ "$SKIP_IMAGE_BUILD" != "1" ]; then
     docker build -f packages/orchestrator/Dockerfile -t "$ORCH_IMAGE" . > "$LOG_DIR/orch-build.log" 2>&1 \
       && pass "built the orchestrator image ${ORCH_IMAGE}" \
@@ -594,21 +707,27 @@ else { console.error("unknown command " + command); process.exit(1); }
   fi
   if [[ "$CONTEXT" == kind-* ]]; then
     KIND_TARGET="${CONTEXT#kind-}"
-    for image in "$ORCH_IMAGE" "$SANDBOX_IMAGE" redis:7-alpine postgres:16-alpine traefik:v3.1; do
+    # The two images this repository builds must reach the nodes; the three registry images may also be pulled.
+    for image in "$ORCH_IMAGE" "$SANDBOX_IMAGE"; do
+      load_into_kind "$image" "$KIND_TARGET" local || fail "could not load $image into the kind nodes (see the output above)"
+      wait_for_api 120 "after loading $image"
+    done
+    for image in redis:7-alpine postgres:16-alpine traefik:v3.1; do
       if docker image inspect "$image" > /dev/null 2>&1; then
-        load_into_kind "$image" "$KIND_TARGET" || fail "kind load docker-image $image"
+        load_into_kind "$image" "$KIND_TARGET" public || fail "could not load $image into the kind nodes, and the nodes could not pull it (see the output above)"
+        wait_for_api 120 "after loading $image"
       else
         note "image $image is not on this host, so the nodes will pull it"
       fi
     done
-    pass "loaded the images into kind"
+    pass "loaded the images into kind (worker nodes: $(kind_nodes))"
   else
     note "not a kind cluster: ${ORCH_IMAGE} and ${SANDBOX_IMAGE} must already be pullable by every node"
   fi
 
   # ---- 5.2 CRDs, namespaces, secrets, manifests ----
   k apply --server-side -f "$TRAEFIK_CRD_URL" > "$LOG_DIR/crds.log" 2>&1 || { tail -n 20 "$LOG_DIR/crds.log"; fail "installing the Traefik CRDs"; }
-  k wait --for=condition=established --timeout=90s crd/ingressroutes.traefik.io crd/middlewares.traefik.io > /dev/null || fail "the Traefik CRDs were not established"
+  kw wait --for=condition=established --timeout=90s crd/ingressroutes.traefik.io crd/middlewares.traefik.io > /dev/null || fail "the Traefik CRDs were not established"
   pass "Traefik CRDs installed (IngressRoute, Middleware)"
 
   SWAPS="$(node -e '
@@ -656,8 +775,8 @@ else { console.error("unknown command " + command); process.exit(1); }
 
   render infra/k8s/redis.yaml | k apply -f - > /dev/null || fail "applying redis.yaml"
   render infra/k8s/postgres.yaml | k apply -f - > /dev/null || fail "applying postgres.yaml"
-  k -n "$SYSTEM_NS" rollout status sts/live-redis --timeout=300s > /dev/null || fail "Redis did not become ready"
-  k -n "$SYSTEM_NS" rollout status sts/live-postgres --timeout=300s > /dev/null || fail "Postgres did not become ready"
+  kw -n "$SYSTEM_NS" rollout status sts/live-redis --timeout=300s > /dev/null || fail "Redis did not become ready"
+  kw -n "$SYSTEM_NS" rollout status sts/live-postgres --timeout=300s > /dev/null || fail "Postgres did not become ready"
   pass "Redis and Postgres are running"
 
   render infra/k8s/orchestrator-deployment.yaml | k apply -f - > /dev/null || fail "applying orchestrator-deployment.yaml"
@@ -665,8 +784,8 @@ else { console.error("unknown command " + command); process.exit(1); }
   render packages/proxy/traefik/ingressroute-crd.yaml | k apply -f - > /dev/null || fail "applying ingressroute-crd.yaml"
   # A re-run must pick up new secrets and images.
   k -n "$SYSTEM_NS" rollout restart deploy/live-orchestrator > /dev/null
-  k -n "$SYSTEM_NS" rollout status deploy/live-proxy --timeout=300s > /dev/null || fail "the proxy did not become ready"
-  k -n "$SYSTEM_NS" rollout status deploy/live-orchestrator --timeout=300s > /dev/null || fail "the orchestrator did not become ready"
+  kw -n "$SYSTEM_NS" rollout status deploy/live-proxy --timeout=300s > /dev/null || fail "the proxy did not become ready"
+  kw -n "$SYSTEM_NS" rollout status deploy/live-orchestrator --timeout=300s > /dev/null || fail "the orchestrator did not become ready"
   READY="$(k -n "$SYSTEM_NS" get deploy live-orchestrator -o json | njs 'd.status.readyReplicas')"
   [ "$READY" = "2" ] || fail "expected 2 ready orchestrator replicas, found ${READY}"
   pass "the proxy and 2 orchestrator replicas are running"
@@ -707,7 +826,7 @@ else { console.error("unknown command " + command); process.exit(1); }
   BOB_TOKEN="$(jget token)"
 
   SIDS=()
-  for n in 1 2 3 4; do
+  for _ in 1 2 3 4; do
     SID="$(create_session "$ALICE_TOKEN")"
     SIDS+=("$SID")
     CREATED_SESSION_IDS+=("$SID")
@@ -836,7 +955,7 @@ else { console.error("unknown command " + command); process.exit(1); }
   DIRECT_POD_NAMES=("sbx-p10orphan")
   sleep 3
   k -n "$SYSTEM_NS" rollout restart deploy/live-orchestrator > /dev/null
-  k -n "$SYSTEM_NS" rollout status deploy/live-orchestrator --timeout=300s > /dev/null || fail "the orchestrator did not come back after a restart"
+  kw -n "$SYSTEM_NS" rollout status deploy/live-orchestrator --timeout=300s > /dev/null || fail "the orchestrator did not come back after a restart"
   start_forwards
   k -n "$SYSTEM_NS" logs -l app.kubernetes.io/name=live-orchestrator --tail=300 2> /dev/null | grep -q "reconciler complete" \
     && pass "the reconciler ran when the orchestrator restarted" || fail "no reconciler run in the orchestrator logs"
