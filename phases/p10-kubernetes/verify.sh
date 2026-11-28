@@ -485,9 +485,9 @@ else { console.error("unknown command " + command); process.exit(1); }
       sleep 2
     done
     [ -n "$api_pod" ] || fail "no Ready orchestrator pod to forward to"
-    k -n "$SYSTEM_NS" port-forward "pod/${api_pod}" "${API_PORT}:4100" > "$LOG_DIR/pf-api.log" 2>&1 &
+    kubectl -n "$SYSTEM_NS" port-forward "pod/${api_pod}" "${API_PORT}:4100" > "$LOG_DIR/pf-api.log" 2>&1 &
     PF_PIDS+=("$!")
-    k -n "$SYSTEM_NS" port-forward svc/live-proxy "${PROXY_PORT}:80" > "$LOG_DIR/pf-proxy.log" 2>&1 &
+    kubectl -n "$SYSTEM_NS" port-forward svc/live-proxy "${PROXY_PORT}:80" > "$LOG_DIR/pf-proxy.log" 2>&1 &
     PF_PIDS+=("$!")
     wait_until 60 url_ok "http://127.0.0.1:${API_PORT}/healthz" || fail "the orchestrator did not answer /healthz through the port-forward"
   }
@@ -576,15 +576,65 @@ else { console.error("unknown command " + command); process.exit(1); }
   set_config() { # set_config KEY=VALUE... : patch the ConfigMap and roll the orchestrator
     local patch
     patch="$(node -e 'const o = {}; for (const a of process.argv.slice(1)) { const i = a.indexOf("="); o[a.slice(0, i)] = a.slice(i + 1); } console.log(JSON.stringify({ data: o }));' "$@")"
-    k -n "$SYSTEM_NS" patch configmap live-orchestrator-config --type merge -p "$patch" > /dev/null
-    k -n "$SYSTEM_NS" rollout restart deploy/live-orchestrator > /dev/null
+    kr -n "$SYSTEM_NS" patch configmap live-orchestrator-config --type merge -p "$patch" > /dev/null || fail "patching the orchestrator configuration"
+    kr -n "$SYSTEM_NS" rollout restart deploy/live-orchestrator > /dev/null || fail "restarting the orchestrator"
     kw -n "$SYSTEM_NS" rollout status deploy/live-orchestrator --timeout=300s > /dev/null || fail "the orchestrator did not come back after a configuration change"
     start_forwards
   }
 
-  api_ready() { k get --raw=/readyz > /dev/null 2>&1; }
+  # A kind cluster on a small VM (slow virtual disk) has an API server that, while images are being unpacked or
+  # built, intermittently drops connections: "net/http: TLS handshake timeout", "connection refused", "EOF".
+  # Those are connection-level errors, not answers, so changes the gate makes are retried while they last.
+  # Any other error (the server saying no) is returned at once, unretried.
+  TRANSIENT_RE='TLS handshake timeout|connection refused|connection reset|i/o timeout|: EOF|unexpected EOF|context deadline exceeded|Client\.Timeout|net/http: request canceled|Unable to connect to the server|the server is currently unable to handle|ServiceUnavailable|etcdserver: request timed out|etcdserver: leader changed|too many requests'
+  retry_k() { # retry_k COMMAND... : run it again, with back-off, while it fails with a connection-level error
+    local attempt rc err="$LOG_DIR/retry.err.$$"
+    for attempt in 1 2 3 4 5 6; do
+      rc=0
+      "$@" 2> "$err" || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        cat "$err" >&2
+        rm -f "$err"
+        return 0
+      fi
+      if [ "$attempt" -lt 6 ] && grep -qiE "$TRANSIENT_RE" "$err"; then
+        note "the API server is not answering reliably (attempt ${attempt}/6: $(head -n 1 "$err" | cut -c1-100)); retrying in $((attempt * 5)) s" >&2
+        sleep $((attempt * 5))
+        continue
+      fi
+      cat "$err" >&2
+      rm -f "$err"
+      return "$rc"
+    done
+  }
+  # kubectl for changes that are safe to repeat (apply, create-if-absent, patch, rollout restart, delete a named
+  # pod). `-f -` is read once into a file so that a retry can send it again.
+  kr() { # kr KUBECTL_ARGS...
+    local args=("$@") i tmp="" rc=0
+    for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+      if [ "${args[i]}" = "-f" ] && [ "${args[i + 1]}" = "-" ]; then
+        tmp="$(mktemp "$LOG_DIR/stdin.XXXXXX")"
+        cat > "$tmp"
+        args[i + 1]="$tmp"
+      fi
+    done
+    retry_k kubectl --request-timeout=60s "${args[@]}" || rc=$?
+    if [ -n "$tmp" ]; then rm -f "$tmp"; fi
+    return "$rc"
+  }
+  # Long waits (a watch that stays open up to --timeout): no client-side request timeout, retried on drops.
+  kw() { retry_k kubectl "$@"; }
+
+  api_ready() { kubectl --request-timeout=8s get --raw=/readyz > /dev/null 2>&1; }
+  api_stable() { # three answers in a row: one lucky answer from a struggling API server proves nothing
+    local i
+    for i in 1 2 3; do
+      api_ready || return 1
+      if [ "$i" -lt 3 ]; then sleep 2; fi
+    done
+  }
   wait_for_api() { # wait_for_api SECONDS WHEN : the control plane must be healthy before anything is applied to it
-    wait_until "$1" api_ready && return 0
+    wait_until "$1" api_stable && return 0
     echo "  API server /readyz: $(k get --raw='/readyz?verbose' 2>&1 | grep -v '^\[+\]' | head -n 8 | tr '\n' ' ')"
     fail "the Kubernetes API server is not ready ($2). The machine is probably short of CPU, memory or disk I/O: give it 4+ CPUs and 8+ GB, or run 'kind delete cluster --name ${KIND_NAME}' and start again"
   }
@@ -603,6 +653,10 @@ else { console.error("unknown command " + command); process.exit(1); }
   # unpacking several hundred MB into its containerd competes with etcd and the API server for disk and
   # CPU, which on a small machine is enough to make the API server's health checks fail.
   image_on_node() { docker exec "$1" crictl inspecti "$2" > /dev/null 2>&1; } # image_on_node NODE IMAGE
+  # Where a node records the host image ID it was last loaded from. Unpacking the ~1 GB sandbox image into a
+  # node on every run is the heaviest disk work in this gate, so a node that already has this exact image is
+  # left alone.
+  image_marker() { printf '/var/lib/p10-image-ids/%s' "$(printf '%s' "$1" | tr '/:@' '___')"; } # image_marker IMAGE
 
   # Imports an image archive into one node's containerd the way kind does, minus --all-platforms/--digests.
   import_into_node() { # import_into_node NODE ARCHIVE
@@ -612,21 +666,12 @@ else { console.error("unknown command " + command); process.exit(1); }
 
   # NODES defaults to the schedulable (worker) nodes. kind names a node after its container, so these are
   # docker container names too.
-  load_into_kind() { # load_into_kind IMAGE KIND_CLUSTER_NAME [public|local] [NODES]
+  load_image_into_nodes() { # load_image_into_nodes IMAGE KIND_CLUSTER_NAME [public|local] [NODES]
     local image="$1" name="$2" kind_of_image="${3:-local}" nodes="${4:-$SCHEDULABLE}" archive="$LOG_DIR/image-load.tar" platform node node_list missing=0
     read -r -a node_list <<< "$nodes" # normalise: single spaces, nothing leading or trailing (a trailing one would become an empty node name below)
     nodes="${node_list[*]}"
     : > "$LOG_DIR/kind-load.log"
     : > "$LOG_DIR/kind-load-fallback.log"
-
-    # Registry images are identified by their tag, so a node that already has one needs nothing.
-    # (A locally built image can change under the same tag, so it is always loaded again.)
-    if [ "$kind_of_image" = "public" ]; then
-      for node in $nodes; do image_on_node "$node" "$image" || missing=1; done
-      if [ "$missing" = "0" ]; then
-        return 0
-      fi
-    fi
 
     # 1. kind's own loader, the fast path where it works.
     if kind load docker-image "$image" --name "$name" --nodes "${nodes// /,}" > "$LOG_DIR/kind-load.log" 2>&1; then
@@ -668,6 +713,35 @@ else { console.error("unknown command " + command); process.exit(1); }
 
     cat "$LOG_DIR/kind-load.log" "$LOG_DIR/kind-load-fallback.log"
     return 1
+  }
+
+  load_into_kind() { # load_into_kind IMAGE KIND_CLUSTER_NAME [public|local] [NODES]
+    local image="$1" kind_of_image="${3:-local}" nodes="${4:-$SCHEDULABLE}" node node_list want_id have_id missing=0 marker
+    read -r -a node_list <<< "$nodes"
+    nodes="${node_list[*]}"
+    want_id="$(docker image inspect -f '{{.Id}}' "$image" 2> /dev/null || true)"
+    marker="$(image_marker "$image")"
+
+    # Already there? A registry image is identified by its tag. A locally built image must also have been
+    # loaded from THIS exact build (the marker holds the host's image ID); a rebuilt one is loaded again.
+    for node in $nodes; do
+      if ! image_on_node "$node" "$image"; then
+        missing=1
+      elif [ "$kind_of_image" != "public" ]; then
+        have_id="$(docker exec "$node" cat "$marker" 2> /dev/null || true)"
+        if [ -z "$want_id" ] || [ "$have_id" != "$want_id" ]; then missing=1; fi
+      fi
+    done
+    if [ "$missing" = "0" ]; then
+      return 0
+    fi
+
+    load_image_into_nodes "$@" || return 1
+    if [ -n "$want_id" ]; then
+      for node in $nodes; do
+        docker exec "$node" sh -c 'mkdir -p /var/lib/p10-image-ids && printf "%s" "$1" > "$2"' _ "$want_id" "$marker" > /dev/null 2>&1 || true
+      done
+    fi
   }
 
   # Makes sure a registry image is on THIS host, pulling it (with retries, through whatever registry mirror the
@@ -727,14 +801,14 @@ else { console.error("unknown command " + command); process.exit(1); }
       wait_for_api 120 "after loading $image"
     done
     if ! k -n kube-system get ds calico-node > /dev/null 2>&1; then
-      k apply -f "$LOG_DIR/calico.yaml" > "$LOG_DIR/calico-apply.log" 2>&1 || { cat "$LOG_DIR/calico-apply.log"; fail "installing Calico"; }
+      kr apply -f "$LOG_DIR/calico.yaml" > "$LOG_DIR/calico-apply.log" 2>&1 || { cat "$LOG_DIR/calico-apply.log"; fail "installing Calico"; }
       # kind nodes are containers on a host whose reverse-path filtering may be "loose"; without this Calico's
       # felix refuses to start there (the documented kind setup).
-      k -n kube-system set env ds/calico-node FELIX_IGNORELOOSERPF=true > /dev/null || fail "configuring Calico for kind"
+      kr -n kube-system set env ds/calico-node FELIX_IGNORELOOSERPF=true > /dev/null || fail "configuring Calico for kind"
     elif ! kw -n kube-system rollout status ds/calico-node --timeout=5s > /dev/null 2>&1; then
       # Installed by an earlier run that could not pull the images: its pods are in back-off. Restart them
       # so they use the images that were just loaded instead of waiting out the back-off.
-      k -n kube-system rollout restart ds/calico-node deploy/calico-kube-controllers > /dev/null || fail "restarting Calico"
+      kr -n kube-system rollout restart ds/calico-node deploy/calico-kube-controllers > /dev/null || fail "restarting Calico"
     fi
     kw -n kube-system rollout status ds/calico-node --timeout=420s > /dev/null || fail "Calico did not become ready"
     kw -n kube-system rollout status deploy/calico-kube-controllers --timeout=300s > /dev/null || fail "calico-kube-controllers did not become ready"
@@ -791,7 +865,10 @@ else { console.error("unknown command " + command); process.exit(1); }
   fi
 
   # ---- 5.2 CRDs, namespaces, secrets, manifests ----
-  k apply --server-side -f "$TRAEFIK_CRD_URL" > "$LOG_DIR/crds.log" 2>&1 || { tail -n 20 "$LOG_DIR/crds.log"; fail "installing the Traefik CRDs"; }
+  wait_for_api 180 "before installing the Traefik CRDs"
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -m 120 -o "$LOG_DIR/traefik-crds.yaml" "$TRAEFIK_CRD_URL" \
+    || fail "could not download the Traefik CRDs from $TRAEFIK_CRD_URL"
+  kr apply --server-side -f "$LOG_DIR/traefik-crds.yaml" > "$LOG_DIR/crds.log" 2>&1 || { tail -n 20 "$LOG_DIR/crds.log"; fail "installing the Traefik CRDs"; }
   kw wait --for=condition=established --timeout=90s crd/ingressroutes.traefik.io crd/middlewares.traefik.io > /dev/null || fail "the Traefik CRDs were not established"
   pass "Traefik CRDs installed (IngressRoute, Middleware)"
 
@@ -808,13 +885,13 @@ else { console.error("unknown command " + command); process.exit(1); }
     note "P10_ALLOW_NO_GVISOR=1: sandboxes run under the default runtime, NOT gVisor"
   fi
 
-  k apply -f infra/k8s/network-policy.yaml > /dev/null || fail "applying network-policy.yaml"
+  kr apply -f infra/k8s/network-policy.yaml > /dev/null || fail "applying network-policy.yaml"
   # --save-config records the object the way `kubectl apply` does, so the manifests below (which also declare
   # this namespace, with its Pod Security labels) can be applied over it without a "missing annotation" warning.
-  k get namespace "$SYSTEM_NS" > /dev/null 2>&1 || k create namespace "$SYSTEM_NS" --save-config > /dev/null
+  k get namespace "$SYSTEM_NS" > /dev/null 2>&1 || kr create namespace "$SYSTEM_NS" --save-config > /dev/null || fail "creating the $SYSTEM_NS namespace"
   ensure_secret() { # ensure_secret NAME KEY VALUE : create once, never rotate (Postgres reads its password only on first start)
     if ! k -n "$SYSTEM_NS" get secret "$1" > /dev/null 2>&1; then
-      k -n "$SYSTEM_NS" create secret generic "$1" --from-literal="$2=$3" > /dev/null || fail "creating secret $1"
+      kr -n "$SYSTEM_NS" create secret generic "$1" --from-literal="$2=$3" > /dev/null || fail "creating secret $1"
     fi
   }
   rand() { node -e 'console.log(require("crypto").randomBytes(+process.argv[1]).toString("hex"))' "$1"; }
@@ -830,27 +907,27 @@ else { console.error("unknown command " + command); process.exit(1); }
     ]));
   ')"
   k -n "$SYSTEM_NS" create secret generic live-orchestrator-auth --from-literal=auth-secret="$(rand 32)" --from-literal=auth-users="$AUTH_USERS" \
-    --dry-run=client -o yaml | k apply -f - > /dev/null || fail "creating the orchestrator auth secret"
+    --dry-run=client -o yaml | kr apply -f - > /dev/null || fail "creating the orchestrator auth secret"
   pass "secrets exist (data-store passwords are kept between runs; sign-in accounts are regenerated)"
 
-  render infra/k8s/redis.yaml | k apply --dry-run=server -f - > /dev/null || fail "the API server rejected redis.yaml"
-  render infra/k8s/postgres.yaml | k apply --dry-run=server -f - > /dev/null || fail "the API server rejected postgres.yaml"
-  render infra/k8s/proxy-deployment.yaml | k apply --dry-run=server -f - > /dev/null || fail "the API server rejected proxy-deployment.yaml"
-  render infra/k8s/orchestrator-deployment.yaml | k apply --dry-run=server -f - > /dev/null || fail "the API server rejected orchestrator-deployment.yaml"
-  render packages/proxy/traefik/ingressroute-crd.yaml | k apply --dry-run=server -f - > /dev/null || fail "the API server rejected ingressroute-crd.yaml"
+  render infra/k8s/redis.yaml | kr apply --dry-run=server -f - > /dev/null || fail "the API server rejected redis.yaml"
+  render infra/k8s/postgres.yaml | kr apply --dry-run=server -f - > /dev/null || fail "the API server rejected postgres.yaml"
+  render infra/k8s/proxy-deployment.yaml | kr apply --dry-run=server -f - > /dev/null || fail "the API server rejected proxy-deployment.yaml"
+  render infra/k8s/orchestrator-deployment.yaml | kr apply --dry-run=server -f - > /dev/null || fail "the API server rejected orchestrator-deployment.yaml"
+  render packages/proxy/traefik/ingressroute-crd.yaml | kr apply --dry-run=server -f - > /dev/null || fail "the API server rejected ingressroute-crd.yaml"
   pass "the API server accepts every manifest (server-side dry run)"
 
-  render infra/k8s/redis.yaml | k apply -f - > /dev/null || fail "applying redis.yaml"
-  render infra/k8s/postgres.yaml | k apply -f - > /dev/null || fail "applying postgres.yaml"
+  render infra/k8s/redis.yaml | kr apply -f - > /dev/null || fail "applying redis.yaml"
+  render infra/k8s/postgres.yaml | kr apply -f - > /dev/null || fail "applying postgres.yaml"
   kw -n "$SYSTEM_NS" rollout status sts/live-redis --timeout=300s > /dev/null || fail "Redis did not become ready"
   kw -n "$SYSTEM_NS" rollout status sts/live-postgres --timeout=300s > /dev/null || fail "Postgres did not become ready"
   pass "Redis and Postgres are running"
 
-  render infra/k8s/orchestrator-deployment.yaml | k apply -f - > /dev/null || fail "applying orchestrator-deployment.yaml"
-  render infra/k8s/proxy-deployment.yaml | k apply -f - > /dev/null || fail "applying proxy-deployment.yaml"
-  render packages/proxy/traefik/ingressroute-crd.yaml | k apply -f - > /dev/null || fail "applying ingressroute-crd.yaml"
+  render infra/k8s/orchestrator-deployment.yaml | kr apply -f - > /dev/null || fail "applying orchestrator-deployment.yaml"
+  render infra/k8s/proxy-deployment.yaml | kr apply -f - > /dev/null || fail "applying proxy-deployment.yaml"
+  render packages/proxy/traefik/ingressroute-crd.yaml | kr apply -f - > /dev/null || fail "applying ingressroute-crd.yaml"
   # A re-run must pick up new secrets and images.
-  k -n "$SYSTEM_NS" rollout restart deploy/live-orchestrator > /dev/null
+  kr -n "$SYSTEM_NS" rollout restart deploy/live-orchestrator > /dev/null || fail "restarting the orchestrator"
   kw -n "$SYSTEM_NS" rollout status deploy/live-proxy --timeout=300s > /dev/null || fail "the proxy did not become ready"
   kw -n "$SYSTEM_NS" rollout status deploy/live-orchestrator --timeout=300s > /dev/null || fail "the orchestrator did not become ready"
   READY="$(k -n "$SYSTEM_NS" get deploy live-orchestrator -o json | njs 'd.status.readyReplicas')"
@@ -1017,11 +1094,11 @@ else { console.error("unknown command " + command); process.exit(1); }
   KEEP_SID="$(create_session "$ALICE_TOKEN")" || fail "could not create the session that must survive the restart"; CREATED_SESSION_IDS+=("$KEEP_SID")
   STALE_SID="$(create_session "$ALICE_TOKEN")" || fail "could not create the session whose pod will vanish"; CREATED_SESSION_IDS+=("$STALE_SID")
   KEEP_UID="$(k -n "$SANDBOX_NS" get pod "sbx-${KEEP_SID}" -o jsonpath='{.metadata.uid}')"
-  k -n "$SANDBOX_NS" delete pod "sbx-${STALE_SID}" --wait=true > /dev/null || fail "could not delete the stale session's pod"
+  kr -n "$SANDBOX_NS" delete pod "sbx-${STALE_SID}" --wait=true --ignore-not-found > /dev/null || fail "could not delete the stale session's pod"
   manager spawn p10orphan > /dev/null 2>&1 || fail "could not create the orphan sandbox"
   DIRECT_POD_NAMES=("sbx-p10orphan")
   sleep 3
-  k -n "$SYSTEM_NS" rollout restart deploy/live-orchestrator > /dev/null
+  kr -n "$SYSTEM_NS" rollout restart deploy/live-orchestrator > /dev/null || fail "restarting the orchestrator"
   kw -n "$SYSTEM_NS" rollout status deploy/live-orchestrator --timeout=300s > /dev/null || fail "the orchestrator did not come back after a restart"
   start_forwards
   k -n "$SYSTEM_NS" logs -l app.kubernetes.io/name=live-orchestrator --tail=300 2> /dev/null | grep -q "reconciler complete" \
