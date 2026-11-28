@@ -557,53 +557,7 @@ else { console.error("unknown command " + command); process.exit(1); }
     fail "the Kubernetes API server is not ready ($2). The machine is probably short of CPU, memory or disk I/O: give it 4+ CPUs and 8+ GB, or run 'kind delete cluster --name ${KIND_NAME}' and start again"
   }
 
-  # ---- 5.0 pick (or create) the cluster, and isolate this run's kubeconfig ----
-  if [ "$CREATE_KIND" = "1" ]; then
-    if kind get clusters 2> /dev/null | grep -qx "$KIND_NAME"; then
-      note "reusing the existing kind cluster ${KIND_NAME}"
-    else
-      KIND_CONFIG="kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n- role: worker\n- role: worker\n"
-      if [ "$KIND_CNI" = "calico" ]; then
-        KIND_CONFIG="${KIND_CONFIG}networking:\n  disableDefaultCNI: true\n"
-      fi
-      printf "$KIND_CONFIG" | kind create cluster --name "$KIND_NAME" --config - > "$LOG_DIR/kind-create.log" 2>&1 \
-        || { cat "$LOG_DIR/kind-create.log"; fail "kind create cluster"; }
-      KIND_CREATED_BY_GATE=1
-      pass "created kind cluster ${KIND_NAME} (1 control-plane + 2 workers, CNI: ${KIND_CNI})"
-    fi
-  fi
-  kubectl config get-contexts -o name | grep -qx "$CONTEXT" || fail "kubectl context \"$CONTEXT\" does not exist"
-  # A kubeconfig holding only this context: nothing below can touch another cluster.
-  kubectl config view --minify --flatten --context="$CONTEXT" > "$LOG_DIR/kubeconfig" || fail "could not read context $CONTEXT"
-  chmod 600 "$LOG_DIR/kubeconfig"
-  export KUBECONFIG="$LOG_DIR/kubeconfig"
-  CLUSTER_STARTED=1
-  k version > /dev/null 2>&1 || fail "cannot reach the cluster of context $CONTEXT"
-  wait_for_api 120 "right after connecting"
-  # A kind cluster created without a CNI (calico mode) stays NotReady until Calico is installed. Install it
-  # whenever it is missing, not only on the run that created the cluster: an earlier run may have stopped
-  # before Calico was applied.
-  if [ "$CREATE_KIND" = "1" ] && [ "$KIND_CNI" = "calico" ] \
-    && ! k -n kube-system get ds calico-node > /dev/null 2>&1 && ! k -n kube-system get ds kindnet > /dev/null 2>&1; then
-    k apply -f "$CALICO_URL" > "$LOG_DIR/calico.log" 2>&1 || { cat "$LOG_DIR/calico.log"; fail "installing Calico"; }
-    # kind nodes are containers on a host whose reverse-path filtering may be "loose"; without this Calico's
-    # felix refuses to start there (the documented kind setup).
-    k -n kube-system set env ds/calico-node FELIX_IGNORELOOSERPF=true > /dev/null || fail "configuring Calico for kind"
-    kw -n kube-system rollout status ds/calico-node --timeout=420s > /dev/null || fail "Calico did not become ready"
-    kw -n kube-system rollout status deploy/calico-kube-controllers --timeout=300s > /dev/null || fail "calico-kube-controllers did not become ready"
-    pass "installed Calico, so NetworkPolicy is enforced"
-  fi
-  kw wait --for=condition=Ready node --all --timeout=300s > /dev/null || fail "not every node became Ready"
-  # Cluster DNS carries every Service lookup below (Redis, Postgres, the sandbox Services).
-  kw -n kube-system rollout status deploy/coredns --timeout=300s > /dev/null || fail "CoreDNS did not become ready"
-  wait_for_api 120 "after the nodes became Ready"
-
-  SCHEDULABLE="$(k get nodes -o json | njs 'd.items.filter((n) => n.status.conditions.some((c) => c.type === "Ready" && c.status === "True") && !n.spec.unschedulable && !(n.spec.taints || []).some((t) => t.effect === "NoSchedule" || t.effect === "NoExecute")).map((n) => n.metadata.name).join(" ")')"
-  NODE_COUNT="$(echo "$SCHEDULABLE" | wc -w | tr -d ' ')"
-  [ "$NODE_COUNT" -ge 2 ] || fail "the cluster has $NODE_COUNT Ready schedulable node(s) (${SCHEDULABLE}); Phase 10 needs at least 2"
-  pass "context ${CONTEXT} has ${NODE_COUNT} Ready schedulable nodes: ${SCHEDULABLE}"
-
-  # ---- 5.1 images ----
+  # ---- image loading helpers (used for Calico below, then for the project images in 5.1) ----
   #
   # `kind load docker-image` can fail on a host whose Docker uses the containerd image store (the default
   # on new installs). Pulled images are then multi-platform indexes that also carry attestation manifests,
@@ -616,8 +570,6 @@ else { console.error("unknown command " + command); process.exit(1); }
   # Images go to the schedulable (worker) nodes only. The control-plane node cannot run workloads, and
   # unpacking several hundred MB into its containerd competes with etcd and the API server for disk and
   # CPU, which on a small machine is enough to make the API server's health checks fail.
-  kind_nodes() { echo "$SCHEDULABLE"; } # kind names a node after its container, so these are docker container names
-
   image_on_node() { docker exec "$1" crictl inspecti "$2" > /dev/null 2>&1; } # image_on_node NODE IMAGE
 
   # Imports an image archive into one node's containerd the way kind does, minus --all-platforms/--digests.
@@ -626,9 +578,12 @@ else { console.error("unknown command " + command); process.exit(1); }
       >> "$LOG_DIR/kind-load-fallback.log" 2>&1
   }
 
-  load_into_kind() { # load_into_kind IMAGE KIND_CLUSTER_NAME [public]
-    local image="$1" name="$2" kind_of_image="${3:-local}" archive="$LOG_DIR/image-load.tar" platform node nodes missing=0
-    nodes="$(kind_nodes)"
+  # NODES defaults to the schedulable (worker) nodes. kind names a node after its container, so these are
+  # docker container names too.
+  load_into_kind() { # load_into_kind IMAGE KIND_CLUSTER_NAME [public|local] [NODES]
+    local image="$1" name="$2" kind_of_image="${3:-local}" nodes="${4:-$SCHEDULABLE}" archive="$LOG_DIR/image-load.tar" platform node node_list missing=0
+    read -r -a node_list <<< "$nodes" # normalise: single spaces, nothing leading or trailing (a trailing one would become an empty node name below)
+    nodes="${node_list[*]}"
     : > "$LOG_DIR/kind-load.log"
     : > "$LOG_DIR/kind-load-fallback.log"
 
@@ -683,6 +638,87 @@ else { console.error("unknown command " + command); process.exit(1); }
     return 1
   }
 
+  # Makes sure a registry image is on THIS host, pulling it (with retries, through whatever registry mirror the
+  # host's Docker daemon uses) when it is not. The kind nodes' own containerd does not use that mirror, so on a
+  # network where Docker Hub drops connections ("EOF", "TLS handshake timeout") the nodes cannot pull for
+  # themselves; the host pulls once and the image is loaded into the nodes from here.
+  # shellcheck source=scripts/lib/docker-net.sh
+  . scripts/lib/docker-net.sh
+  ensure_host_image() { # ensure_host_image IMAGE
+    docker image inspect "$1" > /dev/null 2>&1 && return 0
+    note "pulling $1 on this host (up to 5 attempts)"
+    if docker_pull_retry "$1" 5; then
+      return 0
+    fi
+    echo "$PULL_LOG" | grep -vE '^$|docker run --help' | tail -n 3 | sed 's/^/          /'
+    echo "          -> $(explain_pull_error "$PULL_LOG")"
+    echo "          -> a registry mirror may help: bash scripts/use-registry-mirror.sh on"
+    return 1
+  }
+
+  # ---- 5.0 pick (or create) the cluster, and isolate this run's kubeconfig ----
+  if [ "$CREATE_KIND" = "1" ]; then
+    if kind get clusters 2> /dev/null | grep -qx "$KIND_NAME"; then
+      note "reusing the existing kind cluster ${KIND_NAME}"
+    else
+      KIND_CONFIG="kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n- role: worker\n- role: worker\n"
+      if [ "$KIND_CNI" = "calico" ]; then
+        KIND_CONFIG="${KIND_CONFIG}networking:\n  disableDefaultCNI: true\n"
+      fi
+      printf "$KIND_CONFIG" | kind create cluster --name "$KIND_NAME" --config - > "$LOG_DIR/kind-create.log" 2>&1 \
+        || { cat "$LOG_DIR/kind-create.log"; fail "kind create cluster"; }
+      KIND_CREATED_BY_GATE=1
+      pass "created kind cluster ${KIND_NAME} (1 control-plane + 2 workers, CNI: ${KIND_CNI})"
+    fi
+  fi
+  kubectl config get-contexts -o name | grep -qx "$CONTEXT" || fail "kubectl context \"$CONTEXT\" does not exist"
+  # A kubeconfig holding only this context: nothing below can touch another cluster.
+  kubectl config view --minify --flatten --context="$CONTEXT" > "$LOG_DIR/kubeconfig" || fail "could not read context $CONTEXT"
+  chmod 600 "$LOG_DIR/kubeconfig"
+  export KUBECONFIG="$LOG_DIR/kubeconfig"
+  CLUSTER_STARTED=1
+  k version > /dev/null 2>&1 || fail "cannot reach the cluster of context $CONTEXT"
+  wait_for_api 120 "right after connecting"
+  # A kind cluster created without a CNI (calico mode) stays NotReady until Calico is installed. Install it
+  # whenever it is missing, not only on the run that created the cluster: an earlier run may have stopped
+  # before Calico was applied.
+  if [ "$CREATE_KIND" = "1" ] && [ "$KIND_CNI" = "calico" ] && ! k -n kube-system get ds kindnet > /dev/null 2>&1; then
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -m 120 -o "$LOG_DIR/calico.yaml" "$CALICO_URL" \
+      || fail "could not download the Calico manifest from $CALICO_URL"
+    # Calico runs on EVERY node, the control-plane included, so its images go to all of them. They are loaded
+    # from this host BEFORE the manifest is applied: a node that has to pull them itself from Docker Hub sits
+    # in ImagePullBackOff on a flaky connection, and every node stays NotReady.
+    ALL_KIND_NODES="$(kind get nodes --name "$KIND_NAME" | paste -sd' ' -)"
+    for image in $(sed -n 's/^ *image: *//p' "$LOG_DIR/calico.yaml" | sort -u); do
+      ensure_host_image "$image" || fail "could not pull the Calico image $image on this host. Fix the pull (see above) and run the gate again, or use P10_KIND_CNI=default P10_ALLOW_NO_NETPOL=1 (kindnet; NetworkPolicy is then not enforced)"
+      load_into_kind "$image" "$KIND_NAME" public "$ALL_KIND_NODES" || fail "could not load $image into the kind nodes (see the output above)"
+      wait_for_api 120 "after loading $image"
+    done
+    if ! k -n kube-system get ds calico-node > /dev/null 2>&1; then
+      k apply -f "$LOG_DIR/calico.yaml" > "$LOG_DIR/calico-apply.log" 2>&1 || { cat "$LOG_DIR/calico-apply.log"; fail "installing Calico"; }
+      # kind nodes are containers on a host whose reverse-path filtering may be "loose"; without this Calico's
+      # felix refuses to start there (the documented kind setup).
+      k -n kube-system set env ds/calico-node FELIX_IGNORELOOSERPF=true > /dev/null || fail "configuring Calico for kind"
+    elif ! kw -n kube-system rollout status ds/calico-node --timeout=5s > /dev/null 2>&1; then
+      # Installed by an earlier run that could not pull the images: its pods are in back-off. Restart them
+      # so they use the images that were just loaded instead of waiting out the back-off.
+      k -n kube-system rollout restart ds/calico-node deploy/calico-kube-controllers > /dev/null || fail "restarting Calico"
+    fi
+    kw -n kube-system rollout status ds/calico-node --timeout=420s > /dev/null || fail "Calico did not become ready"
+    kw -n kube-system rollout status deploy/calico-kube-controllers --timeout=300s > /dev/null || fail "calico-kube-controllers did not become ready"
+    pass "installed Calico (images loaded from this host), so NetworkPolicy is enforced"
+  fi
+  kw wait --for=condition=Ready node --all --timeout=300s > /dev/null || fail "not every node became Ready"
+  # Cluster DNS carries every Service lookup below (Redis, Postgres, the sandbox Services).
+  kw -n kube-system rollout status deploy/coredns --timeout=300s > /dev/null || fail "CoreDNS did not become ready"
+  wait_for_api 120 "after the nodes became Ready"
+
+  SCHEDULABLE="$(k get nodes -o json | njs 'd.items.filter((n) => n.status.conditions.some((c) => c.type === "Ready" && c.status === "True") && !n.spec.unschedulable && !(n.spec.taints || []).some((t) => t.effect === "NoSchedule" || t.effect === "NoExecute")).map((n) => n.metadata.name).join(" ")')"
+  NODE_COUNT="$(echo "$SCHEDULABLE" | wc -w | tr -d ' ')"
+  [ "$NODE_COUNT" -ge 2 ] || fail "the cluster has $NODE_COUNT Ready schedulable node(s) (${SCHEDULABLE}); Phase 10 needs at least 2"
+  pass "context ${CONTEXT} has ${NODE_COUNT} Ready schedulable nodes: ${SCHEDULABLE}"
+
+  # ---- 5.1 images ----
   # The sandbox image is built locally and is in no registry: a kind cluster cannot get it any other way.
   if [[ "$CONTEXT" == kind-* ]] && ! docker image inspect "$SANDBOX_IMAGE" > /dev/null 2>&1; then
     fail "the sandbox image ${SANDBOX_IMAGE} is not on this host, and no cluster can pull it. Build it first: bash scripts/seed-sandbox-image.sh"
@@ -713,14 +749,11 @@ else { console.error("unknown command " + command); process.exit(1); }
       wait_for_api 120 "after loading $image"
     done
     for image in redis:7-alpine postgres:16-alpine traefik:v3.1; do
-      if docker image inspect "$image" > /dev/null 2>&1; then
-        load_into_kind "$image" "$KIND_TARGET" public || fail "could not load $image into the kind nodes, and the nodes could not pull it (see the output above)"
-        wait_for_api 120 "after loading $image"
-      else
-        note "image $image is not on this host, so the nodes will pull it"
-      fi
+      ensure_host_image "$image" || fail "could not pull $image on this host (see above)"
+      load_into_kind "$image" "$KIND_TARGET" public || fail "could not load $image into the kind nodes, and the nodes could not pull it (see the output above)"
+      wait_for_api 120 "after loading $image"
     done
-    pass "loaded the images into kind (worker nodes: $(kind_nodes))"
+    pass "loaded the images into kind (worker nodes: ${SCHEDULABLE})"
   else
     note "not a kind cluster: ${ORCH_IMAGE} and ${SANDBOX_IMAGE} must already be pullable by every node"
   fi

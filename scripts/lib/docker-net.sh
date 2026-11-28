@@ -17,7 +17,7 @@ explain_pull_error() {
     echo "TLS certificate rejected; the VM clock is probably wrong. Check: timedatectl ; fix: sudo systemctl restart systemd-timesyncd"
   elif echo "$text" | grep -qiE "no such host|temporary failure in name resolution|server misbehaving"; then
     echo "DNS lookups on the VM are failing (the resolver, not the registry). Run: bash scripts/diagnose-network.sh --apply"
-  elif echo "$text" | grep -qiE "tls handshake timeout|i/o timeout|context deadline exceeded|timed out|connection reset"; then
+  elif echo "$text" | grep -qiE "tls handshake timeout|i/o timeout|context deadline exceeded|timed out|connection reset|: eof|unexpected eof"; then
     echo "the network path to the registry drops packets or is unreliable. Run: bash scripts/diagnose-network.sh --apply   (it measures DNS, IPv6 and MTU and fixes what it finds)"
   elif echo "$text" | grep -qiE "connection refused|network is unreachable|no route to host"; then
     echo "the VM has no route to the registry. Check: ping -c1 1.1.1.1 ; ip route"
