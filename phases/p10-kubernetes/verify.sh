@@ -464,9 +464,28 @@ else { console.error("unknown command " + command); process.exit(1); }
 '
   manager() { REPO_ROOT="$REPO_ROOT" SANDBOX_IMAGE="$SANDBOX_IMAGE" node --input-type=module -e "$MANAGER_JS" "$@"; }
 
+  # After `rollout restart`, `rollout status` returns while the OLD pods are still shutting down (a 5 s preStop
+  # pause plus a graceful stop). `kubectl port-forward svc/...` may attach to one of those: /healthz still
+  # answers, then the pod exits and the tunnel dies in the middle of the next step. So the forward goes to
+  # one specific pod: the newest one that is Ready and not being deleted.
+  ready_pod() { # ready_pod APP_NAME -> the pod's name (nothing if there is none yet)
+    k -n "$SYSTEM_NS" get pods -l "app.kubernetes.io/name=$1" -o json 2> /dev/null | njs '
+      d.items
+        .filter((p) => !p.metadata.deletionTimestamp && p.status.phase === "Running"
+          && (p.status.conditions || []).some((c) => c.type === "Ready" && c.status === "True"))
+        .sort((a, b) => b.metadata.creationTimestamp.localeCompare(a.metadata.creationTimestamp))
+        .map((p) => p.metadata.name)[0]' || true
+  }
   start_forwards() {
     stop_forwards
-    k -n "$SYSTEM_NS" port-forward svc/live-orchestrator "${API_PORT}:4100" > "$LOG_DIR/pf-api.log" 2>&1 &
+    local api_pod=""
+    for _ in $(seq 1 30); do
+      api_pod="$(ready_pod live-orchestrator)"
+      [ -n "$api_pod" ] && break
+      sleep 2
+    done
+    [ -n "$api_pod" ] || fail "no Ready orchestrator pod to forward to"
+    k -n "$SYSTEM_NS" port-forward "pod/${api_pod}" "${API_PORT}:4100" > "$LOG_DIR/pf-api.log" 2>&1 &
     PF_PIDS+=("$!")
     k -n "$SYSTEM_NS" port-forward svc/live-proxy "${PROXY_PORT}:80" > "$LOG_DIR/pf-proxy.log" 2>&1 &
     PF_PIDS+=("$!")
@@ -528,13 +547,24 @@ else { console.error("unknown command " + command); process.exit(1); }
       pass "$description -> $want"
     else
       echo "  response body: $(cat "$LOG_DIR/body.json" 2> /dev/null || true)"
+      if [ "$got" = "000" ]; then
+        echo "  (no HTTP response at all: the port-forward is not working; the body above is from an earlier request) $(tail -n 3 "$LOG_DIR/pf-api.log" 2> /dev/null | tr '\n' ' ')"
+      fi
       fail "$description: expected HTTP $want, got $got"
     fi
   }
-  create_session() { # create_session TOKEN -> prints the session id
+  # Always called as X="$(create_session TOKEN)" || fail "...": inside the command substitution a `fail` would
+  # print its message into the variable and exit only the subshell, so the run would stop with no explanation.
+  create_session() { # create_session TOKEN -> prints the session id; on failure says why on stderr and returns 1
     local got
     got="$(api POST /api/sessions "$1")"
-    [ "$got" = "201" ] || { echo "  response body: $(cat "$LOG_DIR/body.json" 2> /dev/null || true)" >&2; fail "POST /api/sessions: expected 201, got $got"; }
+    if [ "$got" != "201" ]; then
+      echo "  POST /api/sessions: expected 201, got ${got}. Response body: $(cat "$LOG_DIR/body.json" 2> /dev/null || true)" >&2
+      if [ "$got" = "000" ]; then
+        echo "  (no HTTP response at all: the port-forward to the orchestrator is not working) $(tail -n 3 "$LOG_DIR/pf-api.log" 2> /dev/null | tr '\n' ' ')" >&2
+      fi
+      return 1
+    fi
     jget sessionId
   }
   pod_gone() { ! k -n "$SANDBOX_NS" get pod "$1" > /dev/null 2>&1; }
@@ -864,7 +894,7 @@ else { console.error("unknown command " + command); process.exit(1); }
 
   SIDS=()
   for _ in 1 2 3 4; do
-    SID="$(create_session "$ALICE_TOKEN")"
+    SID="$(create_session "$ALICE_TOKEN")" || fail "alice could not create a session"
     SIDS+=("$SID")
     CREATED_SESSION_IDS+=("$SID")
     [ "$(jget containerId)" = "sbx-${SID}" ] || fail "the session's container id is not the pod name sbx-${SID}"
@@ -968,8 +998,8 @@ else { console.error("unknown command " + command); process.exit(1); }
   # The idle reaper, on the cluster.
   echo "-- idle reaper (12 s timeout)"
   set_config SESSION_IDLE_TIMEOUT_MS=12000 IDLE_REAPER_INTERVAL_MS=1000
-  IDLE_SID="$(create_session "$ALICE_TOKEN")"; CREATED_SESSION_IDS+=("$IDLE_SID")
-  LIVE_SID="$(create_session "$ALICE_TOKEN")"; CREATED_SESSION_IDS+=("$LIVE_SID")
+  IDLE_SID="$(create_session "$ALICE_TOKEN")" || fail "could not create the idle session"; CREATED_SESSION_IDS+=("$IDLE_SID")
+  LIVE_SID="$(create_session "$ALICE_TOKEN")" || fail "could not create the session that gets heartbeats"; CREATED_SESSION_IDS+=("$LIVE_SID")
   for ((i = 0; i < 9; i++)); do
     sleep 3
     api POST "/api/sessions/${LIVE_SID}/heartbeat" "$ALICE_TOKEN" > /dev/null
@@ -984,8 +1014,8 @@ else { console.error("unknown command " + command); process.exit(1); }
   # Orchestrator restart and the reconciler.
   echo "-- orchestrator restart and reconciler"
   set_config SESSION_IDLE_TIMEOUT_MS=1800000 IDLE_REAPER_INTERVAL_MS=30000 RECONCILE_GRACE_MS=1000
-  KEEP_SID="$(create_session "$ALICE_TOKEN")"; CREATED_SESSION_IDS+=("$KEEP_SID")
-  STALE_SID="$(create_session "$ALICE_TOKEN")"; CREATED_SESSION_IDS+=("$STALE_SID")
+  KEEP_SID="$(create_session "$ALICE_TOKEN")" || fail "could not create the session that must survive the restart"; CREATED_SESSION_IDS+=("$KEEP_SID")
+  STALE_SID="$(create_session "$ALICE_TOKEN")" || fail "could not create the session whose pod will vanish"; CREATED_SESSION_IDS+=("$STALE_SID")
   KEEP_UID="$(k -n "$SANDBOX_NS" get pod "sbx-${KEEP_SID}" -o jsonpath='{.metadata.uid}')"
   k -n "$SANDBOX_NS" delete pod "sbx-${STALE_SID}" --wait=true > /dev/null || fail "could not delete the stale session's pod"
   manager spawn p10orphan > /dev/null 2>&1 || fail "could not create the orphan sandbox"
